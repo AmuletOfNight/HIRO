@@ -642,6 +642,7 @@ dependencies = [
  "hiro-core",
  "hiro-face",
  "hiro-hw",
+ "libc",
  "log",
  "nix",
  "serde",
@@ -699,6 +700,7 @@ dependencies = [
  "hiro-core",
  "rusqlite",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 

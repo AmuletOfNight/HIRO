@@ -78,6 +78,7 @@ impl Store {
                 name               TEXT PRIMARY KEY,
                 uid                INTEGER,
                 camera_fingerprint TEXT,
+                login_secret       BLOB,
                 created_at         INTEGER NOT NULL
             );
 
@@ -100,6 +101,28 @@ impl Store {
             );
             "#,
         )?;
+        self.migrate()?;
+        Ok(())
+    }
+
+    /// Column-level migrations for stores created before a schema change.
+    /// Kept additive and idempotent: each step only runs when the target
+    /// column/table is missing.
+    fn migrate(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("PRAGMA table_info(users)")
+            .map_err(StoreError::Db)?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(StoreError::Db)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::Db)?;
+        if !cols.iter().any(|c| c == "login_secret") {
+            self.conn
+                .execute_batch("ALTER TABLE users ADD COLUMN login_secret BLOB")
+                .map_err(StoreError::Db)?;
+        }
         Ok(())
     }
 
@@ -241,6 +264,43 @@ impl Store {
             .flatten())
     }
 
+    /// Store the sealed login password for a user (`None` removes it).
+    /// The value is always the AES-256-GCM ciphertext from a `KeyManager`,
+    /// never a plaintext secret.
+    pub fn set_login_secret(&self, user_name: &str, ciphertext: Option<&[u8]>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE users SET login_secret = ?1 WHERE name = ?2",
+            params![ciphertext, user_name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::UserNotFound(user_name.into()));
+        }
+        Ok(())
+    }
+
+    /// Fetch the sealed login password ciphertext for a user.
+    pub fn login_secret(&self, user_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT login_secret FROM users WHERE name = ?1",
+                params![user_name],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Drop the sealed login password for a user. Returns whether a stored
+    /// secret was actually removed (false for users with no record).
+    pub fn clear_login_secret(&self, user_name: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE users SET login_secret = NULL WHERE name = ?1",
+            params![user_name],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn record_event(&self, user_name: Option<&str>, action: &str, detail: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO events (ts, user_name, action, detail) VALUES (unixepoch(), ?1, ?2, ?3)",
@@ -319,6 +379,71 @@ mod tests {
             s.camera_fingerprint("alice").unwrap().unwrap(),
             "13d3:56ea:usb-x:?"
         );
+    }
+
+    #[test]
+    fn login_secret_lifecycle() {
+        let s = store();
+        s.upsert_user("alice", Some(1000)).unwrap();
+        assert!(s.login_secret("alice").unwrap().is_none());
+
+        s.set_login_secret("alice", Some(b"nonce+ct".as_slice()))
+            .unwrap();
+        assert_eq!(s.login_secret("alice").unwrap().unwrap(), b"nonce+ct");
+
+        s.clear_login_secret("alice").unwrap();
+        assert!(s.login_secret("alice").unwrap().is_none());
+        // Clearing again for an existing user still reports true (the row
+        // matched); an unknown user reports false rather than erroring.
+        assert!(s.clear_login_secret("alice").unwrap());
+        assert!(!s.clear_login_secret("nobody").unwrap());
+        assert!(matches!(
+            s.set_login_secret("nobody", Some(b"x".as_slice())),
+            Err(StoreError::UserNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn migration_adds_login_secret_to_legacy_db() {
+        // Simulate a pre-keyring store: create the schema without the
+        // column, then reopen through the normal open path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE users (
+                    name               TEXT PRIMARY KEY,
+                    uid                INTEGER,
+                    camera_fingerprint TEXT,
+                    created_at         INTEGER NOT NULL
+                );
+                CREATE TABLE templates (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name  TEXT NOT NULL,
+                    model      TEXT NOT NULL,
+                    dim        INTEGER NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    quality    REAL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE events (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts        INTEGER NOT NULL,
+                    user_name TEXT,
+                    action    TEXT NOT NULL,
+                    detail    TEXT
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        s.upsert_user("alice", None).unwrap();
+        s.set_login_secret("alice", Some(b"ct".as_slice())).unwrap();
+        assert_eq!(s.login_secret("alice").unwrap().unwrap(), b"ct");
     }
 
     #[test]

@@ -40,6 +40,12 @@ The IR camera needs its 850 nm LED array switched on. HIRO tries, in order:
    `/etc/hiro/quirks.toml` (vendor-specific unit/selector/value).
 2. **`linux-enable-ir-emitter`**, when installed.
 
+The emitter is lit only while a scan is in progress: it is switched on when
+a request starts and switched off as soon as the request finishes. The
+camera stream itself stays open for `warm_stream_seconds` between requests
+so successive scans start fast, but the IR LEDs are never left glowing
+during that idle window.
+
 ### Installing linux-enable-ir-emitter (not in Ubuntu repos)
 
 ```bash

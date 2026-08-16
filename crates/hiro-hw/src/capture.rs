@@ -31,6 +31,12 @@ pub trait VideoSource: Send {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+    /// Discard any frames buffered while the stream sat warm between
+    /// requests. A new request must only ever see frames captured after it
+    /// began; buffered frames can be stale (for example, the user has
+    /// already turned away by the time the next request arrives). The
+    /// default implementation does nothing.
+    fn drain(&mut self) {}
 }
 
 /// mmap-streaming V4L2 source. Capture runs on a dedicated thread; frames
@@ -173,7 +179,18 @@ impl V4lSource {
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                                continue;
+                                // The v4l crate's Stream::next() re-queues
+                                // the previously dequeued buffer *before*
+                                // polling; after a poll timeout that buffer
+                                // is still queued, so the next call would
+                                // re-queue it again and the driver returns
+                                // EINVAL. Stop the stream so the next call
+                                // re-queues every buffer cleanly.
+                                log::debug!(
+                                    "capture: frame read timed out on {}; resetting stream",
+                                    path.display()
+                                );
+                                let _ = StreamTrait::stop(&mut stream);
                             }
                             Err(e) => {
                                 return Err(HwError::Camera(format!(
@@ -238,6 +255,16 @@ impl VideoSource for V4lSource {
         }
         self.frames = None;
         self.started = false;
+    }
+
+    fn drain(&mut self) {
+        if let Some(rx) = &self.frames {
+            // The capture thread is bounded by the channel: it fills up to
+            // `capacity` frames while the stream sat warm, then blocks.
+            // Drop all of them so the next request reads only frames
+            // captured after it started.
+            while rx.try_recv().is_ok() {}
+        }
     }
 
     fn identity(&self) -> CameraIdentity {

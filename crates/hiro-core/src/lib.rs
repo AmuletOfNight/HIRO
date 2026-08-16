@@ -12,7 +12,7 @@ pub use embed::{constant_time_match, Embedding};
 pub use error::{CoreError, Result};
 
 /// Protocol version. Bump on incompatible wire-format changes.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// HIRO version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

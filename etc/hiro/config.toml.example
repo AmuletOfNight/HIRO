@@ -9,7 +9,10 @@ require_ir = true
 # Emitter activation: "auto" (XU quirks DB, then linux-enable-ir-emitter),
 # "external" (only the tool), or "off".
 emitter = "auto"
-# Keep the camera stream open this many seconds after the last use.
+# Keep the camera stream open this many seconds after the last use. The IR
+# emitter itself is switched off as soon as a request finishes and is
+# re-lit when the next request arrives, so it never glows for this whole
+# window.
 warm_stream_seconds = 5
 
 [camera]
@@ -18,8 +21,11 @@ height = 480
 fps = 30
 # FourCC: YUYV (recommended), GRAY8, or MJPG.
 pixel_format = "YUYV"
-# Frames examined per auth attempt before giving up.
-max_frames = 45
+# Frames examined per auth attempt before giving up. This mainly sets how
+# long a user has to satisfy the liveness gate (move slightly) before the
+# attempt is judged; ~4 seconds at 30 fps. Successful matches accept as
+# soon as quorum + liveness are met, so this only bounds slower attempts.
+max_frames = 120
 
 [recognition]
 model_dir = "/usr/share/hiro/models"
@@ -58,3 +64,18 @@ log_level = "info"
 audit = true
 # Never block PAM callers longer than this.
 max_request_timeout_ms = 10000
+
+[keyring]
+# Unlock the login keyring (gnome-keyring / KWallet) on face login.
+# When enabled, `pam_hiro.so keyring` requests the sealed login password
+# after a face match and feeds it to the rest of the PAM stack, so the
+# keyring module can unlock without prompting. The password is enrolled
+# with `hiro keyring set`, stored encrypted under the TPM-sealed data key,
+# and re-verified against the account before every release.
+#
+# Defaults to off: this stores a credential that unlocks the user's
+# keyring, so it must be opted into deliberately.
+enabled = false
+# PAM services whose stack ends in a keyring module (graphical greeters
+# and session logins). `sudo`/`su`/polkit do not unlock a keyring.
+services = ["gdm-password", "sddm", "lightdm", "lightdm-greeter", "login", "tty"]

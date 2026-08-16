@@ -12,6 +12,14 @@ template store. It serves the PAM module and the \fBhiro\fR(1) CLI over a
 Unix socket (default \fI/run/hirod/hirod.sock\fR) and enforces rate limits,
 lockouts, camera pinning, and audit logging.
 .PP
+The daemon also manages the sealed login password used to unlock the login
+keyring on face login: \fBhiro keyring set\fR stores the password
+encrypted under the TPM-sealed data key in the template database, and on a
+verified face match \fBhirod\fR re-checks it against the account
+(\fI/etc/shadow\fR) before releasing it to the PAM module. A changed
+password therefore never blocks login — it simply leaves the keyring
+locked until the user re-enrolls.
+.PP
 The daemon must run as root. Start it via systemd:
 .B systemctl start hirod
 .SH OPTIONS

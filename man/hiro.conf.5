@@ -30,6 +30,13 @@ Template database and encryption key paths.
 .TP
 .B [daemon]
 Socket path, log level, audit toggle, maximum per-request timeout.
+.TP
+.B [keyring]
+Automatic login-keyring unlock on face login. \fIenabled\fR defaults to
+false; when true, \fIservices\fR lists the PAM services (e.g.
+gdm-password) whose stacks receive the injected authtok. The password is
+enrolled with \fBhiro keyring set\fR and re-verified against the account
+before each release.
 .SH RELOADING
 Apply changes with:
 .B hiro reload

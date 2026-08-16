@@ -95,6 +95,29 @@ video4linux/usb character devices, `MemoryDenyWriteExecute`,
 (`PAM_AUTH_ERR` / `PAM_AUTHINFO_UNAVAIL`); a face mismatch can never
 block login, and the module itself performs no recognition.
 
+### Keyring unlock (optional)
+
+With `[keyring] enabled = true` the user may seal their login password
+(`hiro keyring set`) so face login unlocks the login keyring. Control flow
+and mitigations:
+
+- The password is stored only as AES-256-GCM ciphertext under the same
+  TPM-sealed data key that protects templates (see above); plaintext never
+  touches disk.
+- On every face match, `hirod` re-verifies the password against
+  `/etc/shadow` (`crypt_r`, `getspnam_r` — thread-safe, constant-time
+  compare) *before* releasing it to `pam_hiro.so`. A stale or mistyped
+  secret is never released, so a changed password cannot break face login;
+  it only leaves the keyring locked until the user re-enrolls.
+- The password is released only when the caller is authorized
+  (root, or the target user themselves), the face matched, the service is
+  listed in `keyring.services`, and the client asked for it
+  (`pam_hiro.so keyring`).
+- Release and refusal are both audited (`keyring_unlock` events).
+- Trade-off: anyone who can pass face auth for a user can unlock that
+  user's keyring. That is the feature's purpose; disabling `[keyring]`
+  restores the default behavior (face login, keyring stays locked).
+
 ### Supply chain
 
 - Model files are pinned by SHA-256 in the manifest and re-verified at

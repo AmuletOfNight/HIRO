@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 
@@ -118,6 +118,7 @@ fn main() {
             key_manager: Some(key_manager),
             store: None,
             config_path: Some(args.config),
+            password_checker: None,
         },
     ) {
         Ok(d) => d,
@@ -137,7 +138,7 @@ fn main() {
         signal_hook::flag::register(signal_hook::consts::SIGINT, flag).ok();
     }
 
-    let reaper = hirod::camera::spawn_reaper(daemon.camera.clone());
+    let reaper = hirod::camera::spawn_reaper(daemon.camera.clone(), shutdown.clone());
 
     if args.prewarm {
         match daemon.camera.lock() {
@@ -162,8 +163,41 @@ fn main() {
     }
 
     log::info!("shutting down");
-    if let Ok(mut cam) = daemon.camera.lock() {
-        cam.close();
+    close_camera_bounded(&daemon.camera);
+    join_reaper_bounded(reaper);
+}
+
+/// Close the camera with a short grace period for an in-flight request to
+/// release it. If the camera stays busy (e.g. a verify is mid-frame), skip
+/// the clean close: the kernel reclaims the V4L2 device on process exit.
+fn close_camera_bounded(camera: &Arc<Mutex<hirod::camera::CameraSession>>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(mut cam) = camera.try_lock() {
+            cam.close();
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!("camera busy; skipping clean close on shutdown");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let _ = reaper.join();
+}
+
+/// The reaper exits on its own once `shutdown` is set (within one poll
+/// interval). Join it with a bound so a stuck driver can't stall systemd's
+/// stop timeout indefinitely.
+fn join_reaper_bounded(reaper: std::thread::JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !reaper.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if reaper.is_finished() {
+        if reaper.join().is_err() {
+            log::warn!("camera reaper panicked during shutdown");
+        }
+    } else {
+        log::warn!("camera reaper did not exit within 3s; detaching");
+    }
 }

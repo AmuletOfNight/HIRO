@@ -50,7 +50,10 @@ pub struct CameraConfig {
     pub fps: u32,
     /// FourCC as a 4-character string, e.g. "YUYV" or "GRAY8".
     pub pixel_format: String,
-    /// Maximum frames captured per auth attempt before giving up.
+    /// Maximum frames captured per auth attempt before giving up. Bounded
+    /// by `daemon.max_request_timeout_ms` too; this mainly sets how long a
+    /// user has to satisfy the liveness gate (move slightly) before the
+    /// attempt is judged.
     pub max_frames: u32,
 }
 
@@ -61,7 +64,7 @@ impl Default for CameraConfig {
             height: 480,
             fps: 30,
             pixel_format: "YUYV".into(),
-            max_frames: 45,
+            max_frames: 120,
         }
     }
 }
@@ -177,6 +180,43 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Automatic login-keyring unlock on face authentication.
+///
+/// When enabled, the login password the user enrolled with `hiro keyring
+/// set` is stored sealed (AES-256-GCM under the TPM-sealed data key) and,
+/// on a verified face match, handed back to `pam_hiro.so` so it can be fed
+/// to `pam_gnome_keyring.so` / `pam_kwallet.so` via `PAM_AUTHTK`. The
+/// password is re-verified against the account before every release, so a
+/// changed password can never break face login — it just leaves the keyring
+/// locked until the user re-enrolls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyringConfig {
+    /// Master switch. Defaults to off; this feature stores a credential
+    /// that unlocks the user's keyring, so it must be opted into.
+    pub enabled: bool,
+    /// PAM services whose auth stacks end with a keyring module and should
+    /// receive the injected authtok. Graphical greeters and session logins
+    /// are the meaningful cases; `sudo`/`su`/polkit are not.
+    pub services: Vec<String>,
+}
+
+impl Default for KeyringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            services: vec![
+                "gdm-password".into(),
+                "sddm".into(),
+                "lightdm".into(),
+                "lightdm-greeter".into(),
+                "login".into(),
+                "tty".into(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -186,6 +226,7 @@ pub struct Config {
     pub security: SecurityConfig,
     pub storage: StorageConfig,
     pub daemon: DaemonConfig,
+    pub keyring: KeyringConfig,
 }
 
 impl Config {
@@ -236,6 +277,18 @@ impl Config {
             return Err(CoreError::config(
                 "camera.pixel_format must be a 4-character FourCC such as YUYV or GRAY8",
             ));
+        }
+        if self.keyring.enabled && self.keyring.services.is_empty() {
+            return Err(CoreError::config(
+                "keyring.services must list at least one PAM service when keyring is enabled",
+            ));
+        }
+        for svc in &self.keyring.services {
+            if svc.trim().is_empty() {
+                return Err(CoreError::config(
+                    "keyring.services entries must not be empty",
+                ));
+            }
         }
         Ok(())
     }
@@ -304,5 +357,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("FourCC"));
+    }
+
+    #[test]
+    fn keyring_defaults_to_disabled() {
+        let cfg = Config::default();
+        assert!(!cfg.keyring.enabled);
+        assert!(cfg.keyring.services.contains(&"gdm-password".to_string()));
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn keyring_toml_roundtrip() {
+        let cfg = Config::from_toml(
+            r#"
+            [keyring]
+            enabled = true
+            services = ["gdm-password", "sddm"]
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.keyring.enabled);
+        assert_eq!(cfg.keyring.services, vec!["gdm-password", "sddm"]);
+    }
+
+    #[test]
+    fn keyring_enabled_requires_services() {
+        let err = Config::from_toml(
+            r#"
+            [keyring]
+            enabled = true
+            services = []
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("keyring.services"), "{err}");
     }
 }

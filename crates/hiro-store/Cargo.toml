@@ -11,3 +11,6 @@ hiro-core.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

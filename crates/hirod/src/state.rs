@@ -12,6 +12,23 @@ use hiro_tpm::KeyManager;
 use crate::camera::CameraSession;
 use crate::policy::Policy;
 
+/// Checks whether a plaintext password is the current login password for a
+/// user. The production implementation consults `/etc/shadow` via
+/// [`crate::passwd`]; tests inject a stub so the keyring release path can
+/// be exercised without touching the real account database.
+pub trait PasswordChecker: Send + Sync {
+    fn check(&self, user: &str, password: &str) -> bool;
+}
+
+/// The real checker: `crypt(3)` against the shadow entry.
+pub struct ShadowPasswordChecker;
+
+impl PasswordChecker for ShadowPasswordChecker {
+    fn check(&self, user: &str, password: &str) -> bool {
+        crate::passwd::verify_password(user, password)
+    }
+}
+
 /// Everything a request handler needs. Cheap to clone: the heavy pieces
 /// live behind locks.
 pub struct Daemon {
@@ -21,6 +38,9 @@ pub struct Daemon {
     pub pipeline: RwLock<Box<dyn FacePipeline>>,
     pub camera: Arc<Mutex<CameraSession>>,
     pub policy: Mutex<Policy>,
+    /// Verifies a candidate login password against the account (used for
+    /// keyring unlock release).
+    pub password_checker: Box<dyn PasswordChecker>,
     /// Subscribers to authentication state events (`Op::Watch`).
     pub watchers: Mutex<Vec<Sender<String>>>,
     pub config_path: Option<std::path::PathBuf>,
@@ -55,6 +75,7 @@ pub struct DaemonOptions {
     pub key_manager: Option<Box<dyn KeyManager>>,
     pub store: Option<Store>,
     pub config_path: Option<std::path::PathBuf>,
+    pub password_checker: Option<Box<dyn PasswordChecker>>,
 }
 
 impl Daemon {
@@ -72,6 +93,9 @@ impl Daemon {
             Some(p) => p,
             None => hiro_face::create(&cfg.recognition).map_err(|e| e.to_string())?,
         };
+        let password_checker = opts
+            .password_checker
+            .unwrap_or_else(|| Box::new(ShadowPasswordChecker) as Box<dyn PasswordChecker>);
         let camera = Arc::new(Mutex::new(CameraSession::new(
             &cfg,
             quirks.clone(),
@@ -85,6 +109,7 @@ impl Daemon {
             pipeline: RwLock::new(pipeline),
             camera,
             policy: Mutex::new(policy),
+            password_checker,
             watchers: Mutex::new(Vec::new()),
             config_path: opts.config_path,
             started_at: std::time::Instant::now(),

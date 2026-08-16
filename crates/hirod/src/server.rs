@@ -151,7 +151,8 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             user,
             service,
             timeout_ms,
-        } => match auth::verify(daemon, caller, &user, &service, timeout_ms) {
+            want_keyring,
+        } => match auth::verify(daemon, caller, &user, &service, timeout_ms, want_keyring) {
             Ok(result) => Response::ok(id, ResultValue::Verify(result)),
             Err(e) => Response::ok(id, ResultValue::Verify(verdict_from_error(&user, &e))),
         },
@@ -177,6 +178,24 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
         },
         Op::Snapshot { path } => match snapshot(daemon, &path) {
             Ok(()) => Response::ok(id, ResultValue::Snapshot { path }),
+            Err(e) => Response::err(id, e),
+        },
+        Op::KeyringSet { user, password } => match keyring_set(daemon, caller, &user, &password) {
+            Ok(stored) => Response::ok(id, ResultValue::KeyringSet { stored }),
+            Err(e) => Response::err(id, e),
+        },
+        Op::KeyringClear { user } => match keyring_clear(daemon, caller, &user) {
+            Ok(removed) => Response::ok(id, ResultValue::KeyringCleared { removed }),
+            Err(e) => Response::err(id, e),
+        },
+        Op::KeyringStatus { user } => match keyring_status(daemon, caller, &user) {
+            Ok(s) => Response::ok(
+                id,
+                ResultValue::KeyringStatus {
+                    enabled: s.0,
+                    stored: s.1,
+                },
+            ),
             Err(e) => Response::err(id, e),
         },
         Op::Reload => match reload(daemon) {
@@ -214,6 +233,9 @@ fn verdict_from_error(user: &str, e: &str) -> VerifyResult {
         liveness_ok: false,
         camera_ok,
         elapsed_ms: 0,
+        variance: None,
+        motion: None,
+        keyring_password: None,
         reason: reason.into(),
     }
 }
@@ -222,10 +244,11 @@ fn uid_of(user: &str) -> Result<u32, String> {
     crate::lookup::uid_of(user).ok_or_else(|| format!("no such user: {user}"))
 }
 
-fn require_authorized(caller: Caller, user: &str) -> Result<(), String> {
+/// Check the caller may act for `user`, returning the user's uid.
+fn require_authorized(caller: Caller, user: &str) -> Result<u32, String> {
     let uid = uid_of(user)?;
     if authorize(caller, Some(uid)) {
-        Ok(())
+        Ok(uid)
     } else {
         Err(format!("caller uid {} may not act for {user}", caller.uid))
     }
@@ -249,7 +272,7 @@ fn status(daemon: &SharedDaemon) -> Result<StatusResult, String> {
         camera: camera.camera_path(),
         driver: camera.driver(),
         ir_detected: camera.is_ir_candidate(),
-        emitter_active: Some(camera.streaming()),
+        emitter_active: Some(camera.emitter_active()),
         models_loaded: pipeline.loaded(),
         pipeline: pipeline.name().into(),
         templates: store.total_templates().map_err(|e| e.to_string())?,
@@ -313,6 +336,86 @@ fn clear(daemon: &SharedDaemon, caller: Caller, user: &str) -> Result<usize, Str
         &format!("count={count}"),
     );
     Ok(count)
+}
+
+/// Seal and store the login password for keyring unlock.
+///
+/// The password is checked against the account before it is sealed, so a
+/// typo at `hiro keyring set` time is caught immediately instead of at the
+/// next login. Caller must be root or the target user.
+fn keyring_set(
+    daemon: &SharedDaemon,
+    caller: Caller,
+    user: &str,
+    password: &str,
+) -> Result<bool, String> {
+    let uid = require_authorized(caller, user)?;
+    if password.is_empty() {
+        return Err("empty password".into());
+    }
+    if !daemon.password_checker.check(user, password) {
+        return Err(format!(
+            "password does not match the login password for {user}; \
+             keyring unlock not stored"
+        ));
+    }
+    let ciphertext = daemon
+        .km
+        .seal(password.as_bytes())
+        .map_err(|e| format!("cannot seal keyring password: {e}"))?;
+    let store = daemon
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    store
+        .upsert_user(user, Some(i64::from(uid)))
+        .map_err(|e| e.to_string())?;
+    store
+        .set_login_secret(user, Some(&ciphertext))
+        .map_err(|e| e.to_string())?;
+    audit(&store, Some(user), "keyring_set", "login password sealed");
+    Ok(true)
+}
+
+/// Drop the sealed login password.
+fn keyring_clear(daemon: &SharedDaemon, caller: Caller, user: &str) -> Result<bool, String> {
+    require_authorized(caller, user)?;
+    let store = daemon
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let removed = store.clear_login_secret(user).map_err(|e| e.to_string())?;
+    audit(
+        &store,
+        Some(user),
+        "keyring_clear",
+        "sealed password dropped",
+    );
+    Ok(removed)
+}
+
+/// Report whether keyring unlock is configured and a secret is stored.
+fn keyring_status(
+    daemon: &SharedDaemon,
+    caller: Caller,
+    user: &str,
+) -> Result<(bool, bool), String> {
+    require_authorized(caller, user)?;
+    let enabled = daemon
+        .cfg
+        .read()
+        .map_err(|_| "cfg lock poisoned".to_string())?
+        .keyring
+        .enabled;
+    let store = daemon
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let stored = store
+        .login_secret(user)
+        .map_err(|e| e.to_string())?
+        .is_some();
+    Ok((enabled, stored))
 }
 
 fn snapshot(daemon: &SharedDaemon, path: &str) -> Result<(), String> {

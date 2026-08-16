@@ -64,6 +64,12 @@ hiro test
 
 # 8. Enable PAM integration (Debian/Ubuntu)
 sudo pam-auth-update   # tick "HIRO face authentication"
+
+# 9. Optional: unlock the login keyring automatically on face login
+#    (GNOME Keyring / KWallet). Opt in, then store your password once:
+#      [keyring] enabled = true   in /etc/hiro/config.toml, then
+sudo systemctl restart hirod
+hiro keyring set
 ```
 
 For other distros, see `docs/pam.md`.

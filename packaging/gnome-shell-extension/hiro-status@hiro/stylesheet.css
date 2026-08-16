@@ -5,6 +5,9 @@
     padding: 16px 24px;
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
 }
+.hiro-status-column {
+    spacing: 10px;
+}
 .hiro-status-box {
     spacing: 14px;
 }
@@ -12,8 +15,46 @@
     font-size: 18px;
     font-weight: bold;
 }
+.hiro-status-meter {
+    spacing: 6px;
+}
+.hiro-meter-row {
+    spacing: 8px;
+}
+.hiro-meter-caption {
+    font-size: 12px;
+    color: #d5d5d5;
+    text-align: left;
+}
+.hiro-meter-track {
+    background-color: rgba(255, 255, 255, 0.18);
+    border-radius: 3px;
+}
+.hiro-meter-fill {
+    border-radius: 3px;
+}
+.hiro-meter-fill-var {
+    background-color: #ffd166;
+}
+.hiro-meter-fill-mot {
+    background-color: #7fb2f0;
+}
+.hiro-meter-fill-ok {
+    background-color: #66bb6a;
+}
+.hiro-status-hint {
+    font-size: 13px;
+    color: #ffd166;
+    text-align: center;
+}
 .hiro-scanning {
     color: #ffd166;
+}
+.hiro-enrolling {
+    color: #4fc3f7;
+}
+.hiro-enrolling .hiro-status-label {
+    color: #4fc3f7;
 }
 .hiro-ok .hiro-status-label {
     color: #66bb6a;
@@ -26,4 +67,10 @@
 }
 .hiro-fail {
     color: #e57373;
+}
+.hiro-warn .hiro-status-label {
+    color: #ffb74d;
+}
+.hiro-warn {
+    color: #ffb74d;
 }

@@ -59,6 +59,12 @@ enum Command {
     },
     /// Capture one frame to a PGM file (debug aid).
     Snapshot { path: PathBuf },
+    /// Manage the sealed login password used to unlock the keyring on face
+    /// login (see `hiro keyring set`).
+    Keyring {
+        #[command(subcommand)]
+        cmd: KeyringCmd,
+    },
     /// Run hardware diagnostics on this machine.
     Doctor,
     /// Show daemon status.
@@ -69,6 +75,31 @@ enum Command {
     Prewarm,
     /// Reload the daemon configuration.
     Reload,
+}
+
+/// Subcommands of `hiro keyring`.
+#[derive(Subcommand, Debug)]
+enum KeyringCmd {
+    /// Seal the login password so face login unlocks the keyring.
+    ///
+    /// You will be prompted twice to guard against typos. Re-run after
+    /// changing your login password. The password is stored encrypted
+    /// (AES-256-GCM under the TPM-sealed data key) and re-verified against
+    /// the account on every face login.
+    Set {
+        /// User to store it for (default: you).
+        user: Option<String>,
+    },
+    /// Drop the sealed login password.
+    Clear {
+        /// User to clear (default: you).
+        user: Option<String>,
+    },
+    /// Show whether keyring unlock is configured and armed.
+    Status {
+        /// User to inspect (default: you).
+        user: Option<String>,
+    },
 }
 
 fn user_or_default(user: Option<String>) -> Result<String, String> {
@@ -165,7 +196,12 @@ fn main() {
             let user = user_or_default(None);
             user.and_then(|user| {
                 let started = std::time::Instant::now();
-                match client.call(Op::Verify { user, service, timeout_ms: 10_000 }) {
+                match client.call(Op::Verify {
+                    user,
+                    service,
+                    timeout_ms: 10_000,
+                    want_keyring: false,
+                }) {
                     Ok(ResultValue::Verify(v)) => {
                         let elapsed = started.elapsed().as_millis();
                         if v.matched {
@@ -177,7 +213,13 @@ fn main() {
                                 v.liveness_ok
                             );
                         } else {
-                            println!("NO MATCH  reason={} ({elapsed} ms)", v.reason);
+                            match v.variance {
+                                Some(_) => println!(
+                                    "NO MATCH  reason={} variance={:.2} motion={:.4} ({elapsed} ms)",
+                                    v.reason, v.variance.unwrap_or(0.0), v.motion.unwrap_or(0.0)
+                                ),
+                                None => println!("NO MATCH  reason={} ({elapsed} ms)", v.reason),
+                            }
                         }
                         Ok(())
                     }
@@ -196,6 +238,62 @@ fn main() {
             Ok(_) => Err("unexpected daemon response".into()),
             Err(e) => Err(e),
         },
+        Command::Keyring { cmd } => {
+            match cmd {
+                KeyringCmd::Set { user } => {
+                    let user = user_or_default(user);
+                    user.and_then(|user| {
+                    println!("Enrolling your login password for keyring unlock (stored sealed).");
+                    let first = read_hidden_password("Login password: ")?;
+                    let second = read_hidden_password("Repeat login password: ")?;
+                    if first != second {
+                        return Err("passwords do not match; nothing was stored".into());
+                    }
+                    match client.call(Op::KeyringSet {
+                        user,
+                        password: first,
+                    }) {
+                        Ok(ResultValue::KeyringSet { stored: true }) => {
+                            println!("Keyring password stored. Face login will now unlock your keyring.");
+                            println!("Re-run this command after changing your login password.");
+                            Ok(())
+                        }
+                        Ok(_) => Err("unexpected daemon response".into()),
+                        Err(e) => Err(e),
+                    }
+                })
+                }
+                KeyringCmd::Clear { user } => {
+                    let user = user_or_default(user);
+                    user.and_then(|user| match client.call(Op::KeyringClear { user }) {
+                        Ok(ResultValue::KeyringCleared { removed: true }) => {
+                            println!("Sealed keyring password removed.");
+                            Ok(())
+                        }
+                        Ok(_) => Err("no keyring password stored".into()),
+                        Err(e) => Err(e),
+                    })
+                }
+                KeyringCmd::Status { user } => {
+                    let user = user_or_default(user);
+                    user.and_then(|user| match client.call(Op::KeyringStatus { user }) {
+                    Ok(ResultValue::KeyringStatus { enabled, stored }) => {
+                        println!("keyring unlock enabled : {}", if enabled { "yes" } else { "no" });
+                        println!("password stored        : {}", if stored { "yes" } else { "no" });
+                        if !enabled {
+                            println!("note: set [keyring] enabled = true in /etc/hiro/config.toml and restart hirod");
+                        }
+                        if enabled && stored {
+                            println!("face login will unlock the keyring (for listed services).");
+                        }
+                        Ok(())
+                    }
+                    Ok(_) => Err("unexpected daemon response".into()),
+                    Err(e) => Err(e),
+                })
+                }
+            }
+        }
         Command::Doctor => {
             doctor();
             Ok(())
@@ -270,6 +368,55 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Read a line from the terminal with echo disabled (termios), so the
+/// login password is not visible while being typed.
+fn read_hidden_password(prompt: &str) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .or_else(|_| std::fs::OpenOptions::new().read(true).open("/dev/stdin"))
+        .map_err(|e| e.to_string())?;
+    let mut reader = std::io::BufReader::new(&tty);
+    let mut writer = std::io::BufWriter::new(&tty);
+    writer
+        .write_all(prompt.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+
+    let fd = {
+        use std::os::fd::AsRawFd;
+        tty.as_raw_fd()
+    };
+    let mut term = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) != 0 {
+            return Err("tcgetattr failed".into());
+        }
+        t
+    };
+    let orig = term;
+    term.c_lflag &= !libc::ECHO;
+    unsafe {
+        if libc::tcsetattr(fd, libc::TCSANOW, &term) != 0 {
+            return Err("tcsetattr failed".into());
+        }
+    }
+
+    let mut line = String::new();
+    let read_result = reader.read_line(&mut line).map_err(|e| e.to_string());
+    // Restore echo before returning, whatever happens.
+    unsafe {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &orig);
+    }
+    read_result?;
+    let _ = writer.write_all(b"\n");
+    let _ = writer.flush();
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
 /// Format a unix timestamp as days-ago for compact display.

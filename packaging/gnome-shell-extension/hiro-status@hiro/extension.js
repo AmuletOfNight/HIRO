@@ -14,11 +14,16 @@ const TRANSITION_MS = 150;
 const POP_IN_MS = 220;
 const POP_SETTLE_MS = 120;
 const HIDE_MS = 220;
+const METER_WIDTH = 150;
 
 export default class HiroStatusExtension extends Extension {
     enable() {
         this._enabled = true;
         this._state = 'idle';
+        this._op = 'verify';
+        this._enrolling = false;
+        this._accepted = null;
+        this._target = null;
         this._dots = 0;
         this._retry = null;
         this._dotTimer = null;
@@ -28,6 +33,7 @@ export default class HiroStatusExtension extends Extension {
         this._scanStartedAt = 0;
         this._animationToken = 0;
         this._pulseToken = 0;
+        this._lockChangedId = 0;
         this._connection = null;
         this._readLoop = null;
 
@@ -50,13 +56,14 @@ export default class HiroStatusExtension extends Extension {
             style_class: 'hiro-status-overlay',
             reactive: false,
             visible: false,
-            x_expand: true,
-            y_expand: true,
+            x_expand: false,
+            y_expand: false,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.START,
         });
         this._overlay.set_translation(0, 18, 0);
         this._overlay.set_pivot_point(0.5, 0.5);
+        this._column = new St.BoxLayout({style_class: 'hiro-status-column', vertical: true});
         this._box = new St.BoxLayout({style_class: 'hiro-status-box', vertical: false});
         this._boxIcon = new St.Icon({icon_name: 'camera-photo-symbolic', icon_size: 40});
         this._label = new St.Label({
@@ -65,9 +72,53 @@ export default class HiroStatusExtension extends Extension {
         });
         this._box.add_child(this._boxIcon);
         this._box.add_child(this._label);
-        this._overlay.set_child(this._box);
-        const overlayParent = Main.layoutManager.overlayGroup ?? Main.uiGroup;
-        overlayParent.add_child(this._overlay);
+        this._column.add_child(this._box);
+
+        // Live liveness progress meter: one bar per anti-spoof signal
+        // (temporal frame variance and landmark micro-motion), fed by the
+        // daemon's scanning telemetry, plus an actionable hint.
+        this._varianceFill = new St.Widget({
+            style_class: 'hiro-meter-fill hiro-meter-fill-var',
+            height: 6,
+            width: 0,
+            x_align: Clutter.ActorAlign.START,
+        });
+        this._motionFill = new St.Widget({
+            style_class: 'hiro-meter-fill hiro-meter-fill-mot',
+            height: 6,
+            width: 0,
+            x_align: Clutter.ActorAlign.START,
+        });
+        this._meter = new St.BoxLayout({style_class: 'hiro-status-meter', vertical: true});
+        this._meter.add_child(this._makeMeterRow('Scene motion', this._varianceFill));
+        this._meter.add_child(this._makeMeterRow('Head motion', this._motionFill));
+        this._meter.visible = false;
+        this._column.add_child(this._meter);
+
+        this._hint = new St.Label({
+            text: 'Move your head slightly',
+            style_class: 'hiro-status-hint',
+            visible: false,
+        });
+        this._column.add_child(this._hint);
+
+        this._overlay.set_child(this._column);
+        // The lock screen (screen shield) covers the normal overlay layer,
+        // so while locked the indicator must live inside the shield group to
+        // stay visible. Move it between parents as the lock state changes.
+        this._updateOverlayParent = () => {
+            if (!this._overlay) return;
+            const locked = Main.screenShield?.locked ?? false;
+            const target = locked
+                ? (Main.layoutManager.screenShieldGroup ?? Main.layoutManager.overlayGroup)
+                : (Main.layoutManager.overlayGroup ?? Main.uiGroup);
+            if (!target || this._overlay.get_parent() === target) return;
+            target.add_child(this._overlay);
+            this._positionOverlay();
+        };
+        this._updateOverlayParent();
+        this._lockChangedId =
+            Main.screenShield?.connect?.('locked-changed', this._updateOverlayParent) ?? 0;
 
         this._connect();
         this._retry = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
@@ -78,6 +129,10 @@ export default class HiroStatusExtension extends Extension {
 
     disable() {
         this._enabled = false;
+        if (this._lockChangedId) {
+            Main.screenShield?.disconnect?.(this._lockChangedId);
+            this._lockChangedId = 0;
+        }
         this._stopAnimations();
         this._cancelOverlayAnimation();
         if (this._dotTimer) GLib.source_remove(this._dotTimer);
@@ -94,6 +149,21 @@ export default class HiroStatusExtension extends Extension {
         this._overlay = null;
         this._indicator = null;
         this._icon = null;
+    }
+
+    _makeMeterRow(caption, fill) {
+        const cap = new St.Label({text: caption, style_class: 'hiro-meter-caption'});
+        cap.set_width(96);
+        const track = new St.Bin({
+            style_class: 'hiro-meter-track',
+            width: METER_WIDTH,
+            height: 6,
+        });
+        track.set_child(fill);
+        const row = new St.BoxLayout({style_class: 'hiro-meter-row', vertical: false});
+        row.add_child(cap);
+        row.add_child(track);
+        return row;
     }
 
     _setConnected(connected) {
@@ -161,7 +231,12 @@ export default class HiroStatusExtension extends Extension {
                         }
                         try {
                             const ev = JSON.parse(text);
-                            if (ev.state) this.setState(ev.state, ev.score, ev.reason);
+                            if (ev.state)
+                                this.setState(
+                                    ev.state, ev.score, ev.reason,
+                                    ev.variance, ev.motion,
+                                    ev.min_variance, ev.min_motion,
+                                    ev.op, ev.accepted, ev.target, ev.rejected);
                         } catch (e) {
                             console.log(`hiro-status: parse error: ${e?.message}`);
                         }
@@ -179,9 +254,13 @@ export default class HiroStatusExtension extends Extension {
         readAsync();
     }
 
-    setState(state, score, reason) {
+    setState(state, score, reason, variance, motion, minVariance, minMotion,
+             op, accepted, target, rejected) {
         if (!this._enabled || !this._overlay || !this._icon) return;
-        console.log(`hiro-status: state=${state} score=${score} reason=${reason}`);
+        this._op = op === 'enroll' ? 'enroll' : 'verify';
+        this._enrolling = this._op === 'enroll';
+        console.log(`hiro-status: state=${state} op=${this._op} score=${score} reason=${reason} ` +
+            `accepted=${accepted} target=${target} rejected=${rejected}`);
         if (state === 'scanning') {
             this._cancelResultTimer();
             this._pendingResult = null;
@@ -192,28 +271,157 @@ export default class HiroStatusExtension extends Extension {
                 this._cancelOverlayAnimation();
             }
             this._cancelHideTimer();
-            this._icon.style_class = 'system-status-icon hiro-scanning';
+            this._icon.style_class = this._enrolling
+                ? 'system-status-icon hiro-enrolling'
+                : 'system-status-icon hiro-scanning';
             this._startPulse();
             this._startDots();
-            this._showOverlay('Scanning your face', 'camera-photo-symbolic', null, enteringScanning);
+            this._showOverlay(
+                this._enrolling ? 'Enrolling your face' : 'Scanning your face',
+                this._enrolling ? 'contact-new-symbolic' : 'camera-photo-symbolic',
+                this._enrolling ? 'hiro-enrolling' : null,
+                enteringScanning);
+            if (this._enrolling) {
+                // Enrollment has no liveness bars; show template progress
+                // instead (live "n/target" count from the daemon).
+                this._setMeterVisible(false);
+                this._setEnrollProgress(accepted, target);
+            } else {
+                this._updateLiveness(variance, motion, minVariance, minMotion);
+            }
         } else if (state === 'success') {
-            this._queueResult(state, score, reason);
+            this._queueResult(state, score, reason, accepted, target, rejected);
         } else if (state === 'failure') {
-            this._queueResult(state, score, reason);
+            this._queueResult(state, score, reason, accepted, target, rejected);
         } else {
             this._cancelResultTimer();
             this._pendingResult = null;
             this._cancelHideTimer();
             this._state = state;
+            this._enrolling = false;
+            this._accepted = null;
+            this._target = null;
             this._stopAnimations();
             this._cancelOverlayAnimation();
+            this._setMeterVisible(false);
             this._animateOverlayOut(() => {
                 if (this._state === state) this._icon.style_class = 'system-status-icon';
             });
         }
     }
 
-    _queueResult(state, score, reason) {
+    _updateLiveness(variance, motion, minVariance, minMotion) {
+        if (!this._meter || !this._hint) return;
+        if (minVariance == null || minMotion == null ||
+            variance == null || motion == null) {
+            this._setMeterVisible(false);
+            return;
+        }
+        this._setMeterVisible(true);
+        const vOk = variance >= minVariance;
+        const mOk = motion >= minMotion;
+        this._varianceFill.set_width(Math.round(this._barFraction(variance, minVariance) * METER_WIDTH));
+        this._motionFill.set_width(Math.round(this._barFraction(motion, minMotion) * METER_WIDTH));
+        this._varianceFill.style_class =
+            `hiro-meter-fill ${vOk ? 'hiro-meter-fill-ok' : 'hiro-meter-fill-var'}`;
+        this._motionFill.style_class =
+            `hiro-meter-fill ${mOk ? 'hiro-meter-fill-ok' : 'hiro-meter-fill-mot'}`;
+        this._hint.text = vOk && mOk
+            ? 'Good — hold still'
+            : 'Move your head slightly';
+    }
+
+    _setEnrollProgress(accepted, target) {
+        if (accepted != null) this._accepted = accepted;
+        if (target != null) this._target = target;
+        this._updateScanLabel();
+    }
+
+    _updateScanLabel() {
+        if (!this._label) return;
+        if (this._enrolling) {
+            const progress = (this._accepted != null && this._target != null)
+                ? ` (${this._accepted}/${this._target})`
+                : '';
+            this._label.text = 'Enrolling your face' + progress + '.'.repeat(this._dots);
+        } else {
+            this._label.text = 'Scanning your face' + '.'.repeat(this._dots);
+        }
+    }
+
+    _barFraction(value, max) {
+        if (max <= 0 || value == null) return 0;
+        return Math.min(1, Math.max(0, value / max));
+    }
+
+    _setMeterVisible(visible) {
+        if (!this._meter || !this._hint) return;
+        if (this._meter.visible === visible) return;
+        this._meter.visible = visible;
+        this._hint.visible = visible;
+        if (visible) this._positionOverlay();
+    }
+
+    _isImmediateFailure(state, reason) {
+        if (state !== 'failure') return false;
+        const r = String(reason || '').toLowerCase();
+        return r.includes('rate_limited') || r.includes('rate limited') ||
+            r.includes('locked_out') || r.includes('locked out');
+    }
+
+    _reasonLabel(reason) {
+        const r = String(reason || '').toLowerCase();
+        if (r.includes('rate_limited') || r.includes('rate limited'))
+            return 'Rate limited — please wait a moment';
+        if (r.includes('locked_out') || r.includes('locked out'))
+            return 'Too many attempts — try again later';
+        if (r.includes('liveness_failed') || r.includes('liveness'))
+            return 'Not enough movement — try again and move your head slightly';
+        if (r.includes('no_face'))
+            return 'No face detected';
+        if (r.includes('face_too_small'))
+            return 'Face too small — move closer to the camera';
+        if (r.includes('blurry'))
+            return 'Too blurry — hold still and let the camera focus';
+        if (r.includes('static_scene'))
+            return 'Not enough movement — move your head slightly';
+        if (r.includes('duplicate_pose'))
+            return 'Duplicate pose — turn your head a little';
+        if (r.includes('no_luma'))
+            return 'Camera frames unreadable';
+        if (r.includes('no_templates') || r.includes('no template'))
+            return 'No face enrolled yet';
+        if (r.includes('template_limit'))
+            return 'Template limit reached — remove some templates first';
+        if (r.includes('camera_mismatch'))
+            return 'Camera changed since enrollment';
+        if (r.includes('camera'))
+            return 'Camera unavailable';
+        if (r.includes('no_such_user') || r.includes('no such user'))
+            return 'User not found';
+        if (r.includes('denied'))
+            return 'Access denied';
+        if (r.includes('no_match'))
+            return 'Face not recognized';
+        if (r === 'error' || r === '')
+            return 'Something went wrong';
+        return null;
+    }
+
+    _queueResult(state, score, reason, accepted, target, rejected) {
+        // Rate-limited / locked-out requests are rejected before any scan
+        // happens, so tell the user immediately instead of faking a scan.
+        if (this._isImmediateFailure(state, reason)) {
+            this._cancelResultTimer();
+            this._cancelHideTimer();
+            this._stopAnimations();
+            this._cancelOverlayAnimation();
+            this._pendingResult = {state, score, reason, accepted, target, rejected};
+            this._state = state;
+            this._presentResult();
+            return;
+        }
+
         // A very fast camera match can otherwise replace the scan message
         // before it has rendered for long enough to be useful.
         if (this._state !== 'scanning' || !this._scanStartedAt) {
@@ -221,13 +429,19 @@ export default class HiroStatusExtension extends Extension {
             this._scanStartedAt = GLib.get_monotonic_time();
             this._cancelHideTimer();
             this._cancelOverlayAnimation();
-            this._icon.style_class = 'system-status-icon hiro-scanning';
+            this._icon.style_class = this._enrolling
+                ? 'system-status-icon hiro-enrolling'
+                : 'system-status-icon hiro-scanning';
             this._startPulse();
             this._startDots();
-            this._showOverlay('Scanning your face', 'camera-photo-symbolic', null, true);
+            this._showOverlay(
+                this._enrolling ? 'Enrolling your face' : 'Scanning your face',
+                this._enrolling ? 'contact-new-symbolic' : 'camera-photo-symbolic',
+                this._enrolling ? 'hiro-enrolling' : null,
+                true);
         }
 
-        this._pendingResult = {state, score, reason};
+        this._pendingResult = {state, score, reason, accepted, target, rejected};
         this._cancelResultTimer();
         const elapsedMs = (GLib.get_monotonic_time() - this._scanStartedAt) / 1000;
         const waitMs = Math.ceil(Math.max(0, MIN_SCAN_MS - elapsedMs));
@@ -251,14 +465,38 @@ export default class HiroStatusExtension extends Extension {
 
         this._state = result.state;
         this._stopAnimations();
-        this._icon.style_class = `system-status-icon ${result.state === 'success' ? 'hiro-ok' : 'hiro-fail'}`;
-        const text = result.state === 'success'
-            ? `✓  Verified${result.score ? ' (' + (result.score * 100).toFixed(0) + '%)' : ''}`
-            : (result.reason && result.reason !== 'no_face' ? `Not recognized: ${result.reason}` : 'Not recognized');
-        const iconName = result.state === 'success' ? 'object-select-symbolic' : 'dialog-error-symbolic';
-        const extraClass = result.state === 'success' ? 'hiro-ok' : 'hiro-fail';
+        this._setMeterVisible(false);
+        const warn = this._isImmediateFailure(result.state, result.reason);
+        this._icon.style_class =
+            `system-status-icon ${result.state === 'success' ? 'hiro-ok' : (warn ? 'hiro-warn' : 'hiro-fail')}`;
+
+        let text;
+        let iconName;
+        if (result.state === 'success') {
+            if (this._enrolling) {
+                const n = this._enrollCount(result);
+                text = `✓ ${n} face template${n === 1 ? '' : 's'} enrolled`;
+            } else {
+                text = `✓  Verified${result.score ? ' (' + (result.score * 100).toFixed(0) + '%)' : ''}`;
+            }
+            iconName = 'object-select-symbolic';
+        } else {
+            const label = this._reasonLabel(result.reason);
+            text = label || (this._enrolling ? 'Face enrollment failed' : 'Not recognized');
+            iconName = 'dialog-error-symbolic';
+        }
+        const extraClass = result.state === 'success' ? 'hiro-ok' : (warn ? 'hiro-warn' : 'hiro-fail');
         this._transitionToResult(text, iconName, extraClass);
         this._hideSoon();
+    }
+
+    // Number of templates actually added, taken from the structured field
+    // or (for older daemons) the `added=N` reason string.
+    _enrollCount(result) {
+        if (result.accepted != null) return result.accepted;
+        const m = String(result.reason || '').match(/added=(\d+)/);
+        if (m) return parseInt(m[1], 10);
+        return 0;
     }
 
     _hideSoon() {
@@ -418,7 +656,7 @@ export default class HiroStatusExtension extends Extension {
                 this._dotTimer = null;
                 return false;
             }
-            this._label.text = 'Scanning your face' + '.'.repeat(this._dots);
+            this._updateScanLabel();
             return true;
         });
     }

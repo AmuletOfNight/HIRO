@@ -30,6 +30,11 @@ pub enum Op {
         service: String,
         /// Per-attempt cap in milliseconds; clamped daemon-side.
         timeout_ms: u64,
+        /// Ask the daemon for the sealed login password so the keyring can
+        /// be unlocked. Only honoured when the face matched, the caller is
+        /// authorized, `keyring.enabled` is set, the service is listed in
+        /// `keyring.services`, and the password still matches the account.
+        want_keyring: bool,
     },
     Enroll {
         user: String,
@@ -50,6 +55,21 @@ pub enum Op {
     /// Capture one frame and write it (PNG) to the given path. Debug aid.
     Snapshot {
         path: String,
+    },
+    /// Seal and store the login password for `user` (keyring unlock).
+    KeyringSet {
+        user: String,
+        /// Plaintext login password, sent over the local peer-authenticated
+        /// socket. Never logged.
+        password: String,
+    },
+    /// Drop the stored keyring password for `user`.
+    KeyringClear {
+        user: String,
+    },
+    /// Report whether keyring unlock is configured and armed for `user`.
+    KeyringStatus {
+        user: String,
     },
     Reload,
     Prewarm,
@@ -105,6 +125,9 @@ pub enum ResultValue {
     Removed { id: i64 },
     Cleared { count: usize },
     Snapshot { path: String },
+    KeyringSet { stored: bool },
+    KeyringCleared { removed: bool },
+    KeyringStatus { enabled: bool, stored: bool },
     Reloaded,
     Prewarmed,
 }
@@ -120,8 +143,17 @@ pub struct VerifyResult {
     pub liveness_ok: bool,
     pub camera_ok: bool,
     pub elapsed_ms: u64,
+    /// Peak temporal frame variance observed during the attempt (liveness input).
+    pub variance: Option<f32>,
+    /// Peak landmark micro-motion observed during the attempt (liveness input).
+    pub motion: Option<f32>,
     /// Human-readable explanation of the verdict.
     pub reason: String,
+    /// Sealed login password, unsealed and account-verified after a face
+    /// match. Present only when the client asked for it (`want_keyring`),
+    /// the daemon has the feature enabled, the service is listed, and the
+    /// password still matches the account. `None` otherwise.
+    pub keyring_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,27 +239,90 @@ pub struct CameraProbe {
 pub struct StateEvent {
     /// `idle`, `scanning`, `success`, or `failure`.
     pub state: String,
+    /// Operation that produced this event: `verify` (the default) or
+    /// `enroll`. Watchers use it to show distinct status text and result
+    /// wording for face enrollment vs. authentication.
+    #[serde(default = "default_op")]
+    pub op: String,
     pub user: Option<String>,
     pub score: Option<f32>,
     pub reason: Option<String>,
+    /// Live temporal frame variance observed so far (scanning progress,
+    /// liveness input).
+    pub variance: Option<f32>,
+    /// Live landmark micro-motion observed so far (scanning progress,
+    /// liveness input).
+    pub motion: Option<f32>,
+    /// Liveness variance threshold for the active config (UI bar max).
+    pub min_variance: Option<f32>,
+    /// Liveness motion threshold for the active config (UI bar max).
+    pub min_motion: Option<f32>,
+    /// Enrollment: templates accepted so far during the live scan, or the
+    /// final number added on the terminal event.
+    #[serde(default)]
+    pub accepted: Option<usize>,
+    /// Enrollment: target number of templates for this run (live progress).
+    #[serde(default)]
+    pub target: Option<usize>,
+    /// Enrollment: number of frames rejected during the run (terminal event).
+    #[serde(default)]
+    pub rejected: Option<usize>,
+}
+
+fn default_op() -> String {
+    "verify".into()
 }
 
 impl StateEvent {
     pub fn idle() -> Self {
         Self {
             state: "idle".into(),
+            op: default_op(),
             user: None,
             score: None,
             reason: None,
+            variance: None,
+            motion: None,
+            min_variance: None,
+            min_motion: None,
+            accepted: None,
+            target: None,
+            rejected: None,
         }
     }
 
     pub fn scanning(user: &str) -> Self {
         Self {
             state: "scanning".into(),
+            op: default_op(),
             user: Some(user.into()),
             score: None,
             reason: None,
+            variance: None,
+            motion: None,
+            min_variance: None,
+            min_motion: None,
+            accepted: None,
+            target: None,
+            rejected: None,
+        }
+    }
+
+    /// Start-of-enrollment event: live status for the capture session.
+    pub fn enrolling(user: &str) -> Self {
+        Self {
+            state: "scanning".into(),
+            op: "enroll".into(),
+            user: Some(user.into()),
+            score: None,
+            reason: None,
+            variance: None,
+            motion: None,
+            min_variance: None,
+            min_motion: None,
+            accepted: Some(0),
+            target: None,
+            rejected: None,
         }
     }
 }
@@ -245,6 +340,7 @@ mod tests {
                 user: "alice".into(),
                 service: "sudo".into(),
                 timeout_ms: 3000,
+                want_keyring: false,
             },
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -254,10 +350,12 @@ mod tests {
                 user,
                 service,
                 timeout_ms,
+                want_keyring,
             } => {
                 assert_eq!(user, "alice");
                 assert_eq!(service, "sudo");
                 assert_eq!(timeout_ms, 3000);
+                assert!(!want_keyring);
             }
             _ => panic!("wrong op"),
         }
@@ -282,5 +380,47 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"op\":\"snapshot\""), "unexpected: {json}");
+    }
+
+    #[test]
+    fn keyring_ops_roundtrip() {
+        let json = serde_json::to_string(&Request {
+            v: 1,
+            id: 9,
+            op: Op::KeyringSet {
+                user: "alice".into(),
+                password: "s3cret".into(),
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"op\":\"keyring_set\""), "{json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back.op {
+            Op::KeyringSet { user, password } => {
+                assert_eq!(user, "alice");
+                assert_eq!(password, "s3cret");
+            }
+            _ => panic!("wrong op"),
+        }
+
+        let resp = Response::ok(
+            9,
+            ResultValue::KeyringStatus {
+                enabled: true,
+                stored: true,
+            },
+        );
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"keyring_status\""), "{json}");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.outcome,
+            Outcome::Ok {
+                result: ResultValue::KeyringStatus {
+                    enabled: true,
+                    stored: true
+                }
+            }
+        ));
     }
 }

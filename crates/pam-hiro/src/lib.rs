@@ -8,6 +8,9 @@
 //!
 //! * face match            -> PAM_SUCCESS (with `sufficient` this skips the
 //!   password prompt)
+//! * face match + keyring  -> PAM_AUTHINFO_UNAVAIL *after* the sealed login
+//!   password has been injected as `PAM_AUTHTK`; the stack continues so
+//!   `pam_unix` verifies it silently and the keyring module unlocks
 //! * no match / no face    -> PAM_AUTH_ERR (password fallback proceeds)
 //! * daemon unreachable or
 //!   camera unavailable    -> PAM_AUTHINFO_UNAVAIL (password fallback)
@@ -16,10 +19,15 @@
 //! Module arguments (in the PAM stack line):
 //!   `socket=/path`   daemon socket (default /run/hirod/hirod.sock)
 //!   `timeout_ms=N`   per-attempt cap in milliseconds (default 5000)
+//!   `keyring`        on a face match, inject the daemon-verified login
+//!                    password as `PAM_AUTHTK` and fall through to the rest
+//!                    of the stack (unlock the login keyring). Only useful
+//!                    on services that end with `pam_gnome_keyring` /
+//!                    `pam_kwallet`, e.g. the greeter.
 //!   `debug`          verbose logging via pam_syslog
 //!
 //! Typical stack line:
-//!   `auth sufficient pam_hiro.so socket=/run/hirod/hirod.sock timeout_ms=5000`
+//!   `auth sufficient pam_hiro.so socket=/run/hirod/hirod.sock timeout_ms=5000 keyring`
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{Read, Write};
@@ -33,8 +41,11 @@ const PAM_SYSTEM_ERR: c_int = 4;
 const PAM_AUTH_ERR: c_int = 7;
 const PAM_AUTHINFO_UNAVAIL: c_int = 9;
 const PAM_IGNORE: c_int = 25;
-const PAM_SERVICE: c_int = 3;
+// Item types for pam_[gs]et_item (Linux-PAM _pam_types.h). These must
+// match the values in the installed libpam exactly.
+const PAM_SERVICE: c_int = 1;
 const PAM_USER: c_int = 2;
+const PAM_AUTHTOK: c_int = 6;
 
 const LOG_INFO: c_int = 6;
 const LOG_DEBUG: c_int = 7;
@@ -47,6 +58,7 @@ pub struct PamHandle {
 
 extern "C" {
     fn pam_get_item(pamh: *const PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
+    fn pam_set_item(pamh: *const PamHandle, item_type: c_int, item: *const c_void) -> c_int;
     fn pam_syslog(pamh: *const PamHandle, priority: c_int, fmt: *const c_char, ...);
 }
 
@@ -55,6 +67,12 @@ struct ModuleOptions {
     socket: String,
     timeout_ms: u64,
     debug: bool,
+    /// Ask `hirod` for the sealed login password on a face match and feed
+    /// it to the rest of the stack as `PAM_AUTHTK` so `pam_gnome_keyring`
+    /// / `pam_kwallet` can unlock the login keyring. Add this argument to
+    /// the PAM line only on services whose stack ends with a keyring module
+    /// (graphical greeters, session login).
+    keyring: bool,
 }
 
 fn parse_options(argc: c_int, argv: *const *const c_char) -> ModuleOptions {
@@ -62,6 +80,7 @@ fn parse_options(argc: c_int, argv: *const *const c_char) -> ModuleOptions {
         socket: "/run/hirod/hirod.sock".into(),
         timeout_ms: 5_000,
         debug: false,
+        keyring: false,
     };
     // SAFETY: argc/argv are supplied by libpam and valid for the duration
     // of the module call.
@@ -81,6 +100,8 @@ fn parse_options(argc: c_int, argv: *const *const c_char) -> ModuleOptions {
                 }
             } else if arg == "debug" {
                 opts.debug = true;
+            } else if arg == "keyring" {
+                opts.keyring = true;
             }
         }
     }
@@ -186,6 +207,7 @@ fn ask_daemon(
             user: user.into(),
             service: service.into(),
             timeout_ms: opts.timeout_ms,
+            want_keyring: opts.keyring,
         },
     };
     let mut line = serde_json::to_string(&req).ok()?;
@@ -200,6 +222,18 @@ fn ask_daemon(
         },
         Outcome::Err { .. } => None,
     }
+}
+
+/// Inject `password` as `PAM_AUTHTK` so the remainder of the stack
+/// (`pam_unix ... try_first_pass`, `pam_gnome_keyring`) can use it without
+/// prompting. libpam copies the string, so the caller may drop it after.
+fn set_authtok(pamh: *const PamHandle, password: &str) -> c_int {
+    let Ok(cpassword) = CString::new(password) else {
+        return PAM_SYSTEM_ERR;
+    };
+    // SAFETY: cpassword is a valid NUL-terminated string; libpam strdups
+    // it into the handle before returning.
+    unsafe { pam_set_item(pamh, PAM_AUTHTOK, cpassword.as_ptr().cast()) }
 }
 
 /// The core authenticate implementation, panic-free across the FFI edge.
@@ -222,6 +256,29 @@ fn authenticate_impl(pamh: *const PamHandle, argc: c_int, argv: *const *const c_
 
     match ask_daemon(&opts, &user, &service) {
         Some(verdict) if verdict.matched => {
+            if let Some(password) = verdict.keyring_password.as_deref() {
+                if set_authtok(pamh, password) == PAM_SUCCESS {
+                    log(
+                        pamh,
+                        &opts,
+                        LOG_INFO,
+                        &format!(
+                            "hiro: face match for {user} (score={:?}); keyring authtok injected",
+                            verdict.score
+                        ),
+                    );
+                    // Fall through to `pam_unix ... try_first_pass` (which
+                    // verifies the password without prompting) and then to
+                    // the keyring module, instead of short-circuiting.
+                    return PAM_AUTHINFO_UNAVAIL;
+                }
+                log(
+                    pamh,
+                    &opts,
+                    LOG_ERR,
+                    "hiro: failed to set PAM_AUTHTK; skipping keyring unlock",
+                );
+            }
             log(
                 pamh,
                 &opts,

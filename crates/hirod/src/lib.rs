@@ -6,6 +6,7 @@ pub mod auth;
 pub mod camera;
 pub mod liveness;
 pub mod lookup;
+pub mod passwd;
 pub mod policy;
 pub mod server;
 pub mod state;

@@ -2,7 +2,7 @@
 .SH NAME
 pam_hiro \- PAM module for HIRO face authentication
 .SH SYNOPSIS
-auth    sufficient    pam_hiro.so [socket=PATH] [timeout_ms=N] [debug]
+auth    sufficient    pam_hiro.so [socket=PATH] [timeout_ms=N] [keyring] [debug]
 .SH DESCRIPTION
 \fBpam_hiro.so\fR asks the \fBhirod\fR(8) daemon for a face verdict for the
 user being authenticated.
@@ -13,6 +13,12 @@ Verdict mapping:
 .TP
 face match
 PAM_SUCCESS (with \fBsufficient\fR this skips the password)
+.TP
+face match with \fBkeyring\fR and a released password
+the password is injected as \fBPAM_AUTHTK\fR and the module returns
+PAM_AUTHINFO_UNAVAIL, so the stack continues: \fBpam_unix\fR verifies it
+silently and a following keyring module (e.g. \fBpam_gnome_keyring\fR)
+unlocks the login keyring without prompting
 .TP
 no match
 PAM_AUTH_ERR (password fallback proceeds)
@@ -32,12 +38,23 @@ Daemon socket (default \fI/run/hirod/hirod.sock\fR).
 .B timeout_ms=N
 Per-attempt cap in milliseconds (default 5000).
 .TP
+.B keyring
+On a face match, ask \fBhirod\fR for the sealed login password and feed it
+to the rest of the stack as \fBPAM_AUTHTK\fR so the login keyring unlocks.
+Only meaningful on services whose stack ends with \fBpam_gnome_keyring\fR
+or \fBpam_kwallet\fR (graphical greeters, session login). Requires
+\fI[keyring] enabled = true\fR and \fBhiro keyring set\fR; the daemon
+re-verifies the password against the account before releasing it.
+.TP
 .B debug
 Verbose logging via \fBpam_syslog\fR.
 .SH EXAMPLES
 .nf
-# Debian/Ubuntu: enable via pam-auth-update, or add to /etc/pam.d/sudo:
-auth    sufficient    pam_hiro.so
+# Debian/Ubuntu: enable via pam-auth-update (adds the keyring option), or
+# add to the graphical greeter's stack, e.g. /etc/pam.d/gdm-password:
+auth    sufficient    pam_hiro.so keyring
+# (gdm-password already runs "auth optional pam_gnome_keyring.so" after
+#  common-auth, which is what unlocks the keyring with the injected token)
 .fi
 .SH SECURITY
 The module never holds the camera or templates, performs no recognition

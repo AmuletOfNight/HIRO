@@ -134,6 +134,6 @@ Intel IPU6/MIPI cameras, RealSense depth cameras, RGB-only convenience tier, rem
 | M5 hirod daemon | Done — Unix socket + SO_PEERCRED, rate limiting, lockout, liveness gate, camera pinning, audit, systemd hardening, suspend/resume |
 | M6 pam-hiro | Done — fail-closed `sufficient` module, deb pam-auth-update profile, pamtester guidance |
 | M7 CLI + packaging | Done — enroll/list/remove/clear/test/snapshot/doctor/status; deb builder, PKGBUILD, Fedora spec, polkit >= 127 drop-in |
-| M8 hardening pass | Partial — liveness + pinning + TPM done; keyring unlock, GPU providers, IPC fuzzing open |
+| M8 hardening pass | Partial — liveness + pinning + TPM done; keyring unlock done (TPM-sealed login password, `hiro keyring set`, `pam_hiro keyring`, shadow re-verify); GPU providers, IPC fuzzing open |
 
 

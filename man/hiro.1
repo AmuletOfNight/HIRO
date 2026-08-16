@@ -27,6 +27,18 @@ Remove one template.
 .B clear [USER]
 Remove all templates.
 .TP
+.B keyring set [USER]
+Seal the login password so face login unlocks the keyring (GNOME Keyring /
+KWallet). You are prompted twice to guard against typos; the password is
+verified against the account, then stored encrypted under the TPM-sealed
+data key. Re-run after changing your login password.
+.TP
+.B keyring clear [USER]
+Drop the sealed keyring password.
+.TP
+.B keyring status [USER]
+Show whether keyring unlock is enabled and a password is stored.
+.TP
 .B snapshot PATH
 Capture one frame to a PGM file (debug aid).
 .TP

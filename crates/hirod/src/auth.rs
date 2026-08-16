@@ -70,6 +70,21 @@ fn load_templates(daemon: &SharedDaemon, user: &str) -> AuthResult<Vec<LoadedTem
     Ok(out)
 }
 
+/// Consult policy before announcing a scan. Rate limiting and lockout are
+/// handled here so the UI can show the reason immediately instead of
+/// pretending a scan is about to happen.
+fn policy_gate(daemon: &SharedDaemon, user: &str) -> AuthResult<()> {
+    let mut policy = daemon
+        .policy
+        .lock()
+        .map_err(|_| AuthError::Internal("policy lock poisoned".into()))?;
+    match policy.check(user) {
+        PolicyVerdict::Allow => Ok(()),
+        PolicyVerdict::RateLimited => Err(AuthError::RateLimited),
+        PolicyVerdict::LockedOut => Err(AuthError::LockedOut),
+    }
+}
+
 /// Run a face-verification attempt for `user`.
 pub fn verify(
     daemon: &SharedDaemon,
@@ -77,11 +92,41 @@ pub fn verify(
     user: &str,
     service: &str,
     timeout_ms: u64,
+    want_keyring: bool,
 ) -> Result<VerifyResult, String> {
     let started = Instant::now();
+    if let Err(err) = policy_gate(daemon, user) {
+        // Rejected before any scanning happens; tell watchers right away.
+        let reason = match &err {
+            AuthError::RateLimited => "rate_limited",
+            AuthError::LockedOut => "locked_out",
+            _ => "error",
+        };
+        crate::state::broadcast_state(
+            daemon,
+            &StateEvent {
+                state: "failure".into(),
+                op: "verify".into(),
+                user: Some(user.into()),
+                score: None,
+                reason: Some(reason.into()),
+                variance: None,
+                motion: None,
+                min_variance: None,
+                min_motion: None,
+                accepted: None,
+                target: None,
+                rejected: None,
+            },
+        );
+        return Err(err.to_string());
+    }
     crate::state::broadcast_state(daemon, &StateEvent::scanning(user));
     match verify_inner(daemon, caller, user, service, timeout_ms) {
         Ok(mut result) => {
+            if want_keyring {
+                attach_keyring_password(daemon, user, service, &mut result);
+            }
             result.elapsed_ms = started.elapsed().as_millis() as u64;
             {
                 let mut policy = daemon
@@ -113,9 +158,17 @@ pub fn verify(
                 daemon,
                 &hiro_core::proto::StateEvent {
                     state: if result.matched { "success" } else { "failure" }.into(),
+                    op: "verify".into(),
                     user: Some(user.into()),
                     score: result.score,
                     reason: Some(result.reason.clone()),
+                    variance: result.variance,
+                    motion: result.motion,
+                    min_variance: None,
+                    min_motion: None,
+                    accepted: None,
+                    target: None,
+                    rejected: None,
                 },
             );
             Ok(result)
@@ -135,9 +188,17 @@ pub fn verify(
                 daemon,
                 &hiro_core::proto::StateEvent {
                     state: "failure".into(),
+                    op: "verify".into(),
                     user: Some(user.into()),
                     score: None,
                     reason: Some(e.to_string()),
+                    variance: None,
+                    motion: None,
+                    min_variance: None,
+                    min_motion: None,
+                    accepted: None,
+                    target: None,
+                    rejected: None,
                 },
             );
             Err(e.to_string())
@@ -158,18 +219,6 @@ fn verify_inner(
             "caller uid {} may not verify for {user}",
             caller.uid
         )));
-    }
-
-    {
-        let mut policy = daemon
-            .policy
-            .lock()
-            .map_err(|_| AuthError::Internal("policy lock poisoned".into()))?;
-        match policy.check(user) {
-            PolicyVerdict::Allow => {}
-            PolicyVerdict::RateLimited => return Err(AuthError::RateLimited),
-            PolicyVerdict::LockedOut => return Err(AuthError::LockedOut),
-        }
     }
 
     let cfg = daemon
@@ -197,6 +246,9 @@ fn verify_inner(
             liveness_ok: false,
             camera_ok: true,
             elapsed_ms: 0,
+            variance: None,
+            motion: None,
+            keyring_password: None,
             reason: "no_templates".into(),
         });
     }
@@ -232,6 +284,9 @@ fn verify_inner(
                     liveness_ok: false,
                     camera_ok: false,
                     elapsed_ms: 0,
+                    variance: None,
+                    motion: None,
+                    keyring_password: None,
                     reason: "camera_mismatch".into(),
                 });
             }
@@ -250,6 +305,7 @@ fn verify_inner(
     let mut best_template: Option<i64> = None;
     let mut frames_analyzed = 0u32;
     let mut saw_face = false;
+    let mut liveness_satisfied = false;
 
     let loop_start = Instant::now();
     while frames_analyzed < max_frames && loop_start.elapsed() < deadline {
@@ -266,6 +322,35 @@ fn verify_inner(
             continue;
         };
         variance.update(&gray);
+
+        // Stream live liveness progress to `Op::Watch` subscribers (the
+        // shell extension) so the user gets real-time "keep moving" cues.
+        // Throttled to every few frames, plus an immediate nudge the moment
+        // both signals cross their thresholds.
+        if liveness_enabled {
+            let satisfied = variance.max_diff >= min_variance
+                && motion.max_motion >= min_motion;
+            if frames_analyzed % 3 == 0 || (satisfied && !liveness_satisfied) {
+                liveness_satisfied = satisfied;
+                crate::state::broadcast_state(
+                    daemon,
+                    &StateEvent {
+                        state: "scanning".into(),
+                        op: "verify".into(),
+                        user: Some(user.into()),
+                        score: None,
+                        reason: None,
+                        variance: Some(variance.max_diff),
+                        motion: Some(motion.max_motion),
+                        min_variance: Some(min_variance),
+                        min_motion: Some(min_motion),
+                        accepted: None,
+                        target: None,
+                        rejected: None,
+                    },
+                );
+            }
+        }
 
         let hit = match pipeline.process(&gray, frame.width, frame.height) {
             Ok(Some(hit)) => hit,
@@ -295,34 +380,33 @@ fn verify_inner(
                     let count = hits.entry(tpl.id).or_insert(0);
                     *count += 1;
                     if *count >= quorum {
-                        camera.release();
                         let liveness_ok = !liveness_enabled
                             || (variance.max_diff >= min_variance
                                 && motion.max_motion >= min_motion);
-                        if !liveness_ok {
+                        if liveness_ok {
+                            // The face matched and (when enabled) the
+                            // liveness gate is satisfied: accept now.
+                            camera.release();
                             return Ok(VerifyResult {
-                                matched: false,
+                                matched: true,
                                 user: user.into(),
-                                score: None,
-                                template_id: None,
+                                score: best_score,
+                                template_id: best_template,
                                 frames_analyzed,
-                                liveness_ok: false,
+                                liveness_ok: true,
                                 camera_ok: true,
                                 elapsed_ms: 0,
-                                reason: "liveness_failed".into(),
+                                variance: Some(variance.max_diff),
+                                motion: Some(motion.max_motion),
+                                keyring_password: None,
+                                reason: "match".into(),
                             });
                         }
-                        return Ok(VerifyResult {
-                            matched: true,
-                            user: user.into(),
-                            score: best_score,
-                            template_id: best_template,
-                            frames_analyzed,
-                            liveness_ok: true,
-                            camera_ok: true,
-                            elapsed_ms: 0,
-                            reason: "match".into(),
-                        });
+                        // Quorum met but liveness is not satisfied yet. Do
+                        // NOT fail the user for holding still: keep scanning
+                        // so they have the rest of the window to move. If
+                        // they never do, the loop below reports
+                        // `liveness_failed` instead of matching.
                     }
                 }
             }
@@ -330,21 +414,125 @@ fn verify_inner(
     }
 
     camera.release();
-    let reason = if !saw_face { "no_face" } else { "no_match" };
+    let liveness_ok = !liveness_enabled
+        || (variance.max_diff >= min_variance && motion.max_motion >= min_motion);
+    let quorum_met = hits.values().any(|&c| c >= quorum);
+    let reason = if !saw_face {
+        "no_face"
+    } else if quorum_met && !liveness_ok {
+        "liveness_failed"
+    } else {
+        "no_match"
+    };
     Ok(VerifyResult {
         matched: false,
         user: user.into(),
         score: best_score,
         template_id: best_template,
         frames_analyzed,
-        liveness_ok: variance.max_diff >= min_variance && motion.max_motion >= min_motion,
+        liveness_ok,
         camera_ok: true,
         elapsed_ms: 0,
+        variance: Some(variance.max_diff),
+        motion: Some(motion.max_motion),
+        keyring_password: None,
         reason: reason.into(),
     })
 }
 
+/// After a verified face match, release the sealed login password so the
+/// PAM stack can unlock the login keyring (`pam_gnome_keyring` / KWallet).
+///
+/// All of these must hold or the password stays sealed:
+///
+/// * the request explicitly asked for it (`want_keyring`),
+/// * the match is real,
+/// * the feature is enabled and the PAM service is listed in
+///   `keyring.services`,
+/// * a sealed secret exists and unseals cleanly,
+/// * the password still matches the account in `/etc/shadow`.
+///
+/// The account re-check is what keeps face login working after a password
+/// change: a stale or mistyped secret is simply never released, so the
+/// stack keeps its normal short-circuit behaviour (keyring stays locked)
+/// instead of failing authentication.
+fn attach_keyring_password(
+    daemon: &SharedDaemon,
+    user: &str,
+    service: &str,
+    result: &mut VerifyResult,
+) {
+    if !result.matched {
+        return;
+    }
+    let cfg = match daemon.cfg.read() {
+        Ok(c) => c.clone(),
+        Err(_) => return,
+    };
+    if !cfg.keyring.enabled || !cfg.keyring.services.iter().any(|s| s == service) {
+        return;
+    }
+
+    let secret = {
+        let store = match daemon.store.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match store.login_secret(user) {
+            Ok(Some(ct)) => ct,
+            _ => return,
+        }
+    };
+
+    let plain = match daemon.km.unseal(&secret) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("hiro: cannot unseal keyring password for {user}: {e}");
+            return;
+        }
+    };
+    let Ok(password) = String::from_utf8(plain) else {
+        log::error!("hiro: sealed keyring password for {user} is not valid UTF-8");
+        return;
+    };
+
+    if !daemon.password_checker.check(user, &password) {
+        log::warn!(
+            "hiro: sealed keyring password for {user} no longer matches the account; \
+             re-run `hiro keyring set` to update it"
+        );
+        {
+            let store = match daemon.store.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            audit(
+                &store,
+                Some(user),
+                "keyring_unlock",
+                "skipped: password no longer matches account",
+            );
+        }
+        return;
+    }
+
+    result.keyring_password = Some(password);
+    {
+        let store = match daemon.store.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        audit(&store, Some(user), "keyring_unlock", "armed");
+    }
+}
+
 /// Capture and store new face templates for `user`.
+///
+/// Broadcasts `op: "enroll"` events to `Op::Watch` subscribers so the
+/// status indicator can show a distinct "enrolling" status, live progress,
+/// and the final result (templates added / rejected). Early failures also
+/// produce a terminal `failure` event so the indicator is never left stuck
+/// on a scanning status.
 pub fn enroll(
     daemon: &SharedDaemon,
     caller: Caller,
@@ -352,7 +540,129 @@ pub fn enroll(
     max_models: usize,
 ) -> Result<EnrollResult, String> {
     let started = Instant::now();
-    crate::state::broadcast_state(daemon, &StateEvent::scanning(user));
+    crate::state::broadcast_state(daemon, &StateEvent::enrolling(user));
+
+    match enroll_inner(daemon, caller, user, max_models) {
+        Ok(outcome) => {
+            let added = outcome.result.added;
+            let rejected = outcome.result.rejected;
+            {
+                let store = daemon
+                    .store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_string())?;
+                audit(
+                    &store,
+                    Some(user),
+                    "enroll",
+                    &format!(
+                        "added={added} rejected={rejected} frames={} elapsed_ms={}",
+                        outcome.frames,
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
+            crate::state::broadcast_state(
+                daemon,
+                &StateEvent {
+                    state: if added > 0 { "success" } else { "failure" }.into(),
+                    op: "enroll".into(),
+                    user: Some(user.into()),
+                    score: None,
+                    reason: if added > 0 {
+                        None
+                    } else {
+                        Some(outcome.failure_reason.clone())
+                    },
+                    variance: None,
+                    motion: None,
+                    min_variance: None,
+                    min_motion: None,
+                    accepted: Some(added),
+                    target: Some(outcome.target),
+                    rejected: Some(rejected),
+                },
+            );
+            Ok(outcome.result)
+        }
+        Err(e) => {
+            {
+                let store = daemon
+                    .store
+                    .lock()
+                    .map_err(|_| "store lock poisoned".to_string())?;
+                audit(
+                    &store,
+                    Some(user),
+                    "enroll",
+                    &format!("error={e} elapsed_ms={}", started.elapsed().as_millis()),
+                );
+            }
+            crate::state::broadcast_state(
+                daemon,
+                &StateEvent {
+                    state: "failure".into(),
+                    op: "enroll".into(),
+                    user: Some(user.into()),
+                    score: None,
+                    reason: Some(enroll_error_reason(&e).into()),
+                    variance: None,
+                    motion: None,
+                    min_variance: None,
+                    min_motion: None,
+                    accepted: None,
+                    target: None,
+                    rejected: None,
+                },
+            );
+            Err(e)
+        }
+    }
+}
+
+struct EnrollOutcome {
+    result: EnrollResult,
+    target: usize,
+    frames: u32,
+    /// Machine-readable reason when no templates were captured
+    /// (`no_face`, `face_too_small`, `blurry`, `static_scene`,
+    /// `duplicate_pose`, or `no_face` as the default).
+    failure_reason: String,
+}
+
+/// Record the first rejection reason seen; later reasons do not overwrite
+/// it so the user gets the most likely fixable cause.
+fn note_rejection(reason: &mut Option<&'static str>, what: &'static str) {
+    if reason.is_none() {
+        *reason = Some(what);
+    }
+}
+
+/// Map an early enrollment error to a stable, user-displayable reason code.
+fn enroll_error_reason(e: &str) -> &'static str {
+    if e.contains("no such user") {
+        "no_such_user"
+    } else if e.contains("denied") {
+        "denied"
+    } else if e.contains("template limit") {
+        "template_limit"
+    } else if e.contains("camera changed") {
+        "camera_mismatch"
+    } else if e.contains("camera") {
+        "camera_unavailable"
+    } else {
+        "error"
+    }
+}
+
+/// Capture, quality-gate, and store face templates. Owns the camera for the
+/// duration; always releases it before returning.
+fn enroll_inner(
+    daemon: &SharedDaemon,
+    caller: Caller,
+    user: &str,
+    max_models: usize,
+) -> Result<EnrollOutcome, String> {
     let uid = target_uid(user).map_err(|e| e.to_string())?;
     if !authorize(caller, Some(uid)) {
         return Err(format!(
@@ -406,6 +716,7 @@ pub fn enroll(
             .map_err(|_| "store lock poisoned".to_string())?;
         if let Some(stored) = store.camera_fingerprint(user).map_err(|e| e.to_string())? {
             if stored != current {
+                camera.release();
                 return Err(format!(
                     "camera changed since previous enrollment ({stored} vs {current}); \
                      run `hiro clear` first or set security.allow_camera_change"
@@ -429,6 +740,7 @@ pub fn enroll(
     let mut variance = VarianceTracker::new();
     let mut frames_analyzed = 0u32;
     let mut rejected = 0usize;
+    let mut primary_reject: Option<&'static str> = None;
     let deadline = Duration::from_secs(60);
 
     let loop_start = Instant::now();
@@ -439,11 +751,15 @@ pub fn enroll(
         let frame = match camera.next_frame(Duration::from_millis(250)) {
             Ok(Some(f)) => f,
             Ok(None) => continue,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                camera.release();
+                return Err(e.to_string());
+            }
         };
         frames_analyzed += 1;
         let Some(gray) = frame.to_gray() else {
             rejected += 1;
+            note_rejection(&mut primary_reject, "no_luma");
             log::debug!(
                 "enroll frame rejected: no luma extraction for {:?} ({} bytes, {}x{})",
                 frame.format,
@@ -459,13 +775,17 @@ pub fn enroll(
             Ok(Some(h)) => h,
             Ok(None) => {
                 rejected += 1;
+                note_rejection(&mut primary_reject, "no_face");
                 log::debug!(
                     "enroll frame rejected: face not found (mean={:.1})",
                     gray.iter().map(|&v| f64::from(v)).sum::<f64>() / gray.len() as f64
                 );
                 continue;
             }
-            Err(e) => return Err(format!("pipeline failed: {e}")),
+            Err(e) => {
+                camera.release();
+                return Err(format!("pipeline failed: {e}"));
+            }
         };
 
         let bbox = hit.bbox;
@@ -481,16 +801,19 @@ pub fn enroll(
         if size_ratio < min_area {
             log::debug!("enroll frame rejected: face too small ({size_ratio:.3})");
             rejected += 1;
+            note_rejection(&mut primary_reject, "face_too_small");
             continue;
         }
         if sharpness < min_sharpness {
             log::debug!("enroll frame rejected: blurry ({sharpness:.1})");
             rejected += 1;
+            note_rejection(&mut primary_reject, "blurry");
             continue;
         }
         if diff < min_variance {
             log::debug!("enroll frame rejected: static scene ({diff:.1})");
             rejected += 1;
+            note_rejection(&mut primary_reject, "static_scene");
             continue;
         }
         let too_similar = existing_templates.iter().any(|t| {
@@ -505,6 +828,7 @@ pub fn enroll(
         if too_similar {
             log::debug!("enroll frame rejected: duplicate pose");
             rejected += 1;
+            note_rejection(&mut primary_reject, "duplicate_pose");
             continue;
         }
         candidates.push((hit.embedding, report));
@@ -514,6 +838,23 @@ pub fn enroll(
             target,
             sharpness,
             size_ratio
+        );
+        crate::state::broadcast_state(
+            daemon,
+            &StateEvent {
+                state: "scanning".into(),
+                op: "enroll".into(),
+                user: Some(user.into()),
+                score: None,
+                reason: None,
+                variance: None,
+                motion: None,
+                min_variance: None,
+                min_motion: None,
+                accepted: Some(candidates.len()),
+                target: Some(target),
+                rejected: None,
+            },
         );
     }
 
@@ -544,36 +885,23 @@ pub fn enroll(
     drop(store);
 
     camera.release();
-    {
-        let store = daemon
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        audit(
-            &store,
-            Some(user),
-            "enroll",
-            &format!(
-                "added={added} rejected={rejected} frames={frames_analyzed} elapsed_ms={}",
-                started.elapsed().as_millis()
-            ),
-        );
-    }
-    crate::state::broadcast_state(
-        daemon,
-        &StateEvent {
-            state: if added > 0 { "success" } else { "failure" }.into(),
-            user: Some(user.into()),
-            score: None,
-            reason: Some(format!("added={added}")),
-        },
-    );
 
-    Ok(EnrollResult {
-        added,
-        rejected,
-        template_ids,
-        reports,
+    let failure_reason = if added > 0 {
+        String::new()
+    } else {
+        primary_reject.unwrap_or("no_face").to_string()
+    };
+
+    Ok(EnrollOutcome {
+        result: EnrollResult {
+            added,
+            rejected,
+            template_ids,
+            reports,
+        },
+        target,
+        frames: frames_analyzed,
+        failure_reason,
     })
 }
 
@@ -590,9 +918,25 @@ mod tests {
 
     use crate::camera::CameraSession;
     use crate::policy::Policy;
-    use crate::state::Daemon;
+    use crate::state::{Daemon, PasswordChecker};
+
+    /// Test stand-in for the shadow-password checker.
+    struct StubChecker {
+        /// Whether the candidate password is accepted.
+        ok: bool,
+    }
+
+    impl PasswordChecker for StubChecker {
+        fn check(&self, _user: &str, _password: &str) -> bool {
+            self.ok
+        }
+    }
 
     fn test_daemon() -> SharedDaemon {
+        test_daemon_with_checker(false)
+    }
+
+    fn test_daemon_with_checker(passwords_ok: bool) -> SharedDaemon {
         let mut cfg = Config::default();
         cfg.recognition.detector = "stub".into();
         cfg.recognition.match_threshold = 0.90;
@@ -618,6 +962,7 @@ mod tests {
             pipeline: RwLock::new(pipeline),
             camera,
             policy: Mutex::new(policy),
+            password_checker: Box::new(StubChecker { ok: passwords_ok }),
             watchers: Mutex::new(Vec::new()),
             config_path: None,
             started_at: std::time::Instant::now(),
@@ -648,7 +993,7 @@ mod tests {
         assert!(!enroll_result.template_ids.is_empty());
 
         // Verify with the same face schedule.
-        let result = verify(&daemon, caller, &user, "test-service", 5000).unwrap();
+        let result = verify(&daemon, caller, &user, "test-service", 5000, false).unwrap();
         assert!(result.matched, "verify failed: {result:?}");
         assert!(result.liveness_ok, "liveness should pass: {result:?}");
         assert!(result.frames_analyzed >= 3);
@@ -658,7 +1003,7 @@ mod tests {
             let mut cam = daemon.camera.lock().unwrap();
             cam.set_mock_face_every(None);
         }
-        let result = verify(&daemon, caller, &user, "test-service", 2000).unwrap();
+        let result = verify(&daemon, caller, &user, "test-service", 2000, false).unwrap();
         assert!(
             !result.matched,
             "verify should fail without a face: {result:?}"
@@ -673,7 +1018,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let caller = Caller { uid: 0, pid: 1 };
-        let result = verify(&daemon, caller, &me.name, "test-service", 5000).unwrap();
+        let result = verify(&daemon, caller, &me.name, "test-service", 5000, false).unwrap();
         assert!(!result.matched);
         assert_eq!(result.reason, "no_templates");
     }
@@ -682,7 +1027,15 @@ mod tests {
     fn verify_for_unknown_user_fails() {
         let daemon = test_daemon();
         let caller = Caller { uid: 0, pid: 1 };
-        let err = verify(&daemon, caller, "definitely-not-a-user-xyz", "x", 1000).unwrap_err();
+        let err = verify(
+            &daemon,
+            caller,
+            "definitely-not-a-user-xyz",
+            "x",
+            1000,
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("no such user"), "unexpected error: {err}");
     }
 
@@ -693,7 +1046,101 @@ mod tests {
             .unwrap()
             .unwrap();
         let caller = Caller { uid: 65534, pid: 1 };
-        let err = verify(&daemon, caller, &me.name, "x", 1000).unwrap_err();
+        let err = verify(&daemon, caller, &me.name, "x", 1000, false).unwrap_err();
         assert!(err.contains("denied"));
+    }
+
+    /// Enroll `user` with the mock face, arm a sealed login password, and
+    /// enable keyring unlock for `gdm-password`. Liveness is disabled: the
+    /// deterministic mock's landmark motion is marginal from one verify to
+    /// the next, and these tests exercise the password-release path, not
+    /// the anti-spoof gate.
+    fn arm_keyring(daemon: &SharedDaemon, user: &str) {
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.keyring.enabled = true;
+            cfg.keyring.services = vec!["gdm-password".into()];
+            cfg.recognition.enable_liveness = false;
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        enroll(daemon, Caller { uid: 0, pid: 1 }, user, 4).unwrap();
+        let ciphertext = daemon.km.seal(b"login-password").unwrap();
+        let store = daemon.store.lock().unwrap();
+        store.set_login_secret(user, Some(&ciphertext)).unwrap();
+    }
+
+    #[test]
+    fn keyring_password_released_only_when_armed() {
+        // The account check passes, so the sealed password can be released.
+        let daemon = test_daemon_with_checker(true);
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_keyring(&daemon, &user);
+        let caller = Caller { uid: 0, pid: 1 };
+
+        // Listed service + want_keyring: the password is released.
+        let result = verify(&daemon, caller, &user, "gdm-password", 5000, true).unwrap();
+        assert!(result.matched);
+        assert_eq!(result.keyring_password.as_deref(), Some("login-password"));
+
+        // Not requested: stays sealed.
+        let result = verify(&daemon, caller, &user, "gdm-password", 5000, false).unwrap();
+        assert!(result.matched);
+        assert!(result.keyring_password.is_none());
+
+        // Service not listed: stays sealed.
+        let result = verify(&daemon, caller, &user, "sudo", 5000, true).unwrap();
+        assert!(result.matched);
+        assert!(result.keyring_password.is_none());
+    }
+
+    #[test]
+    fn keyring_password_never_released_when_stale_or_disabled() {
+        // The account check fails (password changed since enrollment): face
+        // login must still succeed, with the keyring password withheld.
+        let daemon = test_daemon_with_checker(false);
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_keyring(&daemon, &user);
+        let caller = Caller { uid: 0, pid: 1 };
+
+        let result = verify(&daemon, caller, &user, "gdm-password", 5000, true).unwrap();
+        assert!(result.matched, "face login must keep working: {result:?}");
+        assert!(result.keyring_password.is_none());
+
+        // Feature disabled daemon-side: not released either.
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.keyring.enabled = false;
+        }
+        let result = verify(&daemon, caller, &user, "gdm-password", 5000, true).unwrap();
+        assert!(result.matched);
+        assert!(result.keyring_password.is_none());
+    }
+
+    #[test]
+    fn keyring_password_not_released_without_match() {
+        let daemon = test_daemon_with_checker(true);
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_keyring(&daemon, &user);
+        // No face after enrollment.
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(None);
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        let result = verify(&daemon, caller, &user, "gdm-password", 2000, true).unwrap();
+        assert!(!result.matched);
+        assert!(result.keyring_password.is_none());
     }
 }
