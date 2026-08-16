@@ -1,0 +1,36 @@
+[Unit]
+Description=HIRO face authentication daemon
+Documentation=man:hirod(8)
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/hirod
+Restart=on-failure
+RestartSec=5s
+
+# Daemon needs root (camera + template encryption key) but is otherwise
+# locked down hard.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hiro /run
+RuntimeDirectory=hirod
+RuntimeDirectoryMode=0755
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-usb rw
+DeviceAllow=/dev/tpm0 rw
+DeviceAllow=/dev/tpmrm0 rw
+RestrictAddressFamilies=AF_UNIX
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

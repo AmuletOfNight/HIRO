@@ -1,0 +1,58 @@
+# Maintainer: HIRO Developers <hiro@example.org>
+# Contributor: HIRO Developers
+pkgname=hiro
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Windows Hello-style face authentication for Linux (IR camera + PAM)"
+arch=('x86_64')
+url="https://github.com/hiro-auth/hiro"
+license=('MIT')
+depends=('libpam' 'systemd-libs')
+makedepends=('cargo' 'gcc' 'pkg-config' 'libtss2-dev')
+optdepends=('linux-enable-ir-emitter: IR emitter activation fallback'
+            'v4l-utils: camera diagnostics')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/hiro-auth/hiro/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/hiro-$pkgver"
+    cargo build --release --features hiro-face/onnx,hiro-tpm/tpm
+    cargo test --workspace
+}
+
+package() {
+    cd "$srcdir/hiro-$pkgver"
+    install -Dm755 target/release/hirod          "$pkgdir/usr/bin/hirod"
+    install -Dm755 target/release/hiro           "$pkgdir/usr/bin/hiro"
+    install -Dm755 target/release/libpam_hiro.so "$pkgdir/usr/lib/security/pam_hiro.so"
+
+    install -Dm644 etc/hiro/config.toml.example "$pkgdir/etc/hiro/config.toml.example"
+    install -Dm644 crates/hiro-hw/quirks.toml   "$pkgdir/etc/hiro/quirks.toml"
+
+    install -Dm644 packaging/systemd/hirod.service        "$pkgdir/usr/lib/systemd/system/hirod.service"
+    install -Dm644 packaging/systemd/hirod-resume.service "$pkgdir/usr/lib/systemd/system/hirod-resume.service"
+    install -Dm644 packaging/udev/99-hiro.rules           "$pkgdir/usr/lib/udev/rules.d/99-hiro.rules"
+    install -Dm644 packaging/polkit/hiro.conf             "$pkgdir/usr/share/hiro/polkit-agent-helper-hiro.conf"
+    install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/metadata.json  "$pkgdir/usr/share/gnome-shell/extensions/hiro-status@hiro/metadata.json"
+    install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/extension.js   "$pkgdir/usr/share/gnome-shell/extensions/hiro-status@hiro/extension.js"
+    install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css "$pkgdir/usr/share/gnome-shell/extensions/hiro-status@hiro/stylesheet.css"
+
+    install -Dm755 scripts/fetch-models.sh               "$pkgdir/usr/share/hiro/fetch-models.sh"
+    install -Dm644 crates/hiro-face/models/manifest.toml "$pkgdir/usr/share/hiro/models/manifest.toml"
+
+    install -Dm644 man/hiro.1      "$pkgdir/usr/share/man/man1/hiro.1"
+    install -Dm644 man/hirod.8     "$pkgdir/usr/share/man/man8/hirod.8"
+    install -Dm644 man/pam_hiro.8  "$pkgdir/usr/share/man/man8/pam_hiro.8"
+    install -Dm644 man/hiro.conf.5 "$pkgdir/usr/share/man/man5/hiro.conf.5"
+
+    install -Dm644 README.md        "$pkgdir/usr/share/doc/hiro/README.md"
+    install -Dm644 docs/security.md "$pkgdir/usr/share/doc/hiro/security.md"
+    install -Dm644 docs/hardware.md "$pkgdir/usr/share/doc/hiro/hardware.md"
+    install -Dm644 docs/pam.md      "$pkgdir/usr/share/doc/hiro/pam.md"
+}
+
+# post_install note: Arch has no pam-auth-update; enable PAM manually per
+# docs/pam.md, then:
+#   systemctl enable --now hirod
+#   sudo hirod --init-keys
+#   sudo /usr/share/hiro/fetch-models.sh

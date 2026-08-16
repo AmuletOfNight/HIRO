@@ -1,0 +1,27 @@
+# HIRO model manifest.
+#
+# `scripts/fetch-models.sh` downloads these files into
+# /usr/share/hiro/models and `hirod` verifies their SHA-256 before loading.
+#
+# Detector: SCRFD-10G-bnKPS (MIT), 5-keypoint ONNX export (insightface).
+# Embedder: AuraFace v1 glintr100 (Apache-2.0), 512-D ArcFace-compatible.
+# Both mirrored on Hugging Face (fal/AuraFace-v1).
+#
+# sha256 fields are intentionally empty until the first verified download:
+# run scripts/fetch-models.sh, confirm the printed hashes, and pin them
+# here (or in /etc/hiro/models-manifest.toml overrides in a future
+# release).
+
+[detector.scrfd]
+file = "scrfd_10g_bnkps.onnx"
+url = "https://huggingface.co/fal/AuraFace-v1/resolve/main/scrfd_10g_bnkps.onnx"
+sha256 = "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91"
+license = "MIT"
+input_w = 640
+
+[embedder.auraface]
+file = "glintr100.onnx"
+url = "https://huggingface.co/fal/AuraFace-v1/resolve/main/glintr100.onnx"
+sha256 = "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60"
+license = "Apache-2.0"
+input_w = 112

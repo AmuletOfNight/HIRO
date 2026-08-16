@@ -1,0 +1,26 @@
+[package]
+name = "hirod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HIRO authentication daemon: owns the camera, models, and templates"
+
+[dependencies]
+hiro-core.workspace = true
+hiro-hw.workspace = true
+hiro-face.workspace = true
+hiro-store.workspace = true
+hiro-tpm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+nix.workspace = true
+libc.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+signal-hook = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

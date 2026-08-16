@@ -1,0 +1,20 @@
+Source: hiro
+Section: admin
+Priority: optional
+Maintainer: HIRO Developers <hiro@example.org>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, libtss2-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/hiro-auth/hiro
+Vcs-Browser: https://github.com/hiro-auth/hiro
+Rules-Requires-Root: no
+
+Package: hiro
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libpam-runtime
+Recommends: v4l-utils
+Suggests: linux-enable-ir-emitter
+Description: Windows Hello-style face authentication for Linux
+ HIRO uses your laptop's built-in Windows Hello IR camera to authenticate
+ through PAM: login, lock screen, sudo, and polkit prompts. Face templates
+ are stored as encrypted embeddings, never images, and the IR emitter is
+ driven automatically. Everything runs locally - no network, no cloud.

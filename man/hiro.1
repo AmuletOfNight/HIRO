@@ -1,0 +1,55 @@
+.TH HIRO 1 "August 2026" "HIRO" "User Commands"
+.SH NAME
+hiro \- enroll and manage face templates for HIRO authentication
+.SH SYNOPSIS
+.B hiro
+[\fB\-\-socket\fR \fIPATH\fR] \fICOMMAND\fR [\fIOPTIONS\fR]
+.SH DESCRIPTION
+HIRO provides Windows Hello-style face authentication on Linux using the
+built-in IR camera. \fBhiro\fR talks to the \fBhirod\fR(8) daemon to enroll,
+test, and manage encrypted face templates.
+.SH COMMANDS
+.TP
+.B enroll [USER] [--max N]
+Capture face templates. Stand in front of the IR camera and follow the
+quality feedback; frames that are blurry, too small, static, or duplicates
+are rejected automatically.
+.TP
+.B test
+Run a verification attempt against your own templates.
+.TP
+.B list [USER]
+List enrolled templates.
+.TP
+.B remove USER --id N
+Remove one template.
+.TP
+.B clear [USER]
+Remove all templates.
+.TP
+.B snapshot PATH
+Capture one frame to a PGM file (debug aid).
+.TP
+.B doctor
+Run hardware diagnostics: camera discovery, IR detection, emitter support,
+model integrity, and daemon reachability.
+.TP
+.B status
+Show daemon status.
+.TP
+.B ping
+Check daemon reachability.
+.TP
+.B prewarm
+Ask the daemon to warm the camera and models.
+.TP
+.B reload
+Reload the daemon configuration.
+.SH OPTIONS
+.TP
+.B --socket PATH
+Daemon socket path (default \fI/run/hirod/hirod.sock\fR).
+.SH SEE ALSO
+.BR hirod (8),
+.BR pam_hiro (8),
+.BR hiro.conf (5)

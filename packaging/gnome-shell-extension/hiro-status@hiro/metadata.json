@@ -1,0 +1,8 @@
+{
+  "uuid": "hiro-status@hiro",
+  "name": "HIRO Face Auth Status",
+  "description": "Animated indicator while HIRO scans your face (lock screen, login, sudo)",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51", "52"],
+  "url": "https://github.com/hiro-auth/hiro",
+  "version": 10
+}

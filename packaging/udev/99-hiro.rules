@@ -1,0 +1,4 @@
+# HIRO: grant the video group access to camera nodes. The daemon runs as
+# root, but `hiro doctor` and enrollment previews benefit from group access
+# for regular users.
+SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"

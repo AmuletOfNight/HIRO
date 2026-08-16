@@ -1,0 +1,23 @@
+[package]
+name = "hiro-tpm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Template encryption key management for HIRO (AES-256-GCM, optional TPM2 sealing)"
+
+[features]
+default = []
+# Seal the AES data key under the TPM 2.0 (storage-hierarchy primary) so the
+# plaintext key never rests on disk. Requires a TPM 2.0 device at runtime.
+tpm = ["dep:tss-esapi"]
+
+[dependencies]
+hiro-core.workspace = true
+thiserror.workspace = true
+aes-gcm.workspace = true
+log.workspace = true
+tss-esapi = { version = "7.7", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

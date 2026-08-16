@@ -1,0 +1,60 @@
+# HIRO daemon configuration. All values shown are the defaults.
+# Missing sections or keys fall back to these values.
+
+[device]
+# Explicit camera node; auto-detected (IR preferred) when unset.
+# path = "/dev/video2"
+# Refuse to authenticate unless the camera looks IR-capable.
+require_ir = true
+# Emitter activation: "auto" (XU quirks DB, then linux-enable-ir-emitter),
+# "external" (only the tool), or "off".
+emitter = "auto"
+# Keep the camera stream open this many seconds after the last use.
+warm_stream_seconds = 5
+
+[camera]
+width = 640
+height = 480
+fps = 30
+# FourCC: YUYV (recommended), GRAY8, or MJPG.
+pixel_format = "YUYV"
+# Frames examined per auth attempt before giving up.
+max_frames = 45
+
+[recognition]
+model_dir = "/usr/share/hiro/models"
+detector = "scrfd"
+embedder = "auraface"
+# Cosine-similarity threshold for a frame hit.
+match_threshold = 0.60
+# Independent frame hits required for a positive verdict.
+quorum_frames = 3
+# Per-attempt time budget.
+frame_timeout_ms = 3000
+# Anti-spoof gate (strongly recommended).
+enable_liveness = true
+liveness_min_variance = 3.0
+liveness_min_motion = 0.002
+# Enrollment quality gates.
+min_face_area = 0.02
+min_sharpness = 5.0
+dedupe_threshold = 0.55
+
+[security]
+rate_limit_attempts = 5
+rate_limit_window_secs = 60
+lockout_secs = 30
+max_templates_per_user = 16
+# Allow authenticating with a different camera than the enrolled one.
+allow_camera_change = false
+
+[storage]
+db_path = "/var/lib/hiro/templates.db"
+key_path = "/var/lib/hiro/hiro.key"
+
+[daemon]
+socket_path = "/run/hirod/hirod.sock"
+log_level = "info"
+audit = true
+# Never block PAM callers longer than this.
+max_request_timeout_ms = 10000

@@ -1,0 +1,18 @@
+# Built-in IR emitter quirks for known Windows Hello cameras.
+#
+# vid/pid are decimal. unit/selector/value form the UVC extension-unit
+# SET_CUR control that switches the IR emitter on.
+#
+# Add overrides in /etc/hiro/quirks.toml using the same schema.
+#
+# NOTE: entries require hardware verification before enabling. If your
+# camera is listed here but the emitter does not light up, run
+# `hiro doctor` and check `dmesg` — a wrong XU tuple is harmless (the
+# camera ignores it) but will not turn the emitter on either.
+[[quirks]]
+vid = 5075   # 0x13d3
+pid = 22250  # 0x56ea
+name = "ASUS ExpertBook IR (placeholder, verify before use)"
+unit = 3
+selector = 1
+value = 1

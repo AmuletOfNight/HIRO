@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|purge)
+        if command -v pam-auth-update >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive pam-auth-update --package --remove hiro || true
+        fi
+        rm -f /etc/systemd/system/polkit-agent-helper@.service.d/hiro.conf
+        if [ -x /usr/bin/deb-systemd-helper ]; then
+            deb-systemd-helper disable hirod.service hirod-resume.service >/dev/null || true
+        fi
+    ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear) ;;
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

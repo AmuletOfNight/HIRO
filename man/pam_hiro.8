@@ -1,0 +1,49 @@
+.TH PAM_HIRO 8 "August 2026" "HIRO" "System Administration"
+.SH NAME
+pam_hiro \- PAM module for HIRO face authentication
+.SH SYNOPSIS
+auth    sufficient    pam_hiro.so [socket=PATH] [timeout_ms=N] [debug]
+.SH DESCRIPTION
+\fBpam_hiro.so\fR asks the \fBhirod\fR(8) daemon for a face verdict for the
+user being authenticated.
+.PP
+Verdict mapping:
+.RS
+.PD 0
+.TP
+face match
+PAM_SUCCESS (with \fBsufficient\fR this skips the password)
+.TP
+no match
+PAM_AUTH_ERR (password fallback proceeds)
+.TP
+daemon unreachable or camera unavailable
+PAM_AUTHINFO_UNAVAIL (password fallback)
+.TP
+unexpected failure
+PAM_SYSTEM_ERR
+.RE
+.PD
+.SH OPTIONS
+.TP
+.B socket=PATH
+Daemon socket (default \fI/run/hirod/hirod.sock\fR).
+.TP
+.B timeout_ms=N
+Per-attempt cap in milliseconds (default 5000).
+.TP
+.B debug
+Verbose logging via \fBpam_syslog\fR.
+.SH EXAMPLES
+.nf
+# Debian/Ubuntu: enable via pam-auth-update, or add to /etc/pam.d/sudo:
+auth    sufficient    pam_hiro.so
+.fi
+.SH SECURITY
+The module never holds the camera or templates, performs no recognition
+itself, and never blocks login: on any failure the password path remains
+available.
+.SH SEE ALSO
+.BR hiro (1),
+.BR hirod (8),
+.BR hiro.conf (5)

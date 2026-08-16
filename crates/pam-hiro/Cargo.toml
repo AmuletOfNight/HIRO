@@ -1,0 +1,17 @@
+[package]
+name = "pam-hiro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PAM module for HIRO face authentication"
+
+[lib]
+name = "pam_hiro"
+crate-type = ["cdylib"]
+
+[dependencies]
+hiro-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true

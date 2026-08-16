@@ -1,0 +1,23 @@
+[package]
+name = "hiro-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HIRO command-line tool: enrollment, management, diagnostics"
+
+[[bin]]
+name = "hiro"
+path = "src/main.rs"
+
+[dependencies]
+hiro-core.workspace = true
+hiro-hw.workspace = true
+hiro-face.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+nix.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true

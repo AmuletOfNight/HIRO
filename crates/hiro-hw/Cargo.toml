@@ -1,0 +1,20 @@
+[package]
+name = "hiro-hw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Camera discovery, V4L2 capture, and IR emitter control for HIRO"
+
+[dependencies]
+hiro-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+nix.workspace = true
+libc.workspace = true
+log.workspace = true
+v4l = { version = "0.14", features = ["v4l2"] }
+toml = "0.8"
+
+[dev-dependencies]
+hiro-face = { workspace = true, features = ["onnx"] }

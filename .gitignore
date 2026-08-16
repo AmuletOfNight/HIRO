@@ -1,0 +1,6 @@
+/target
+Cargo.lock.orig
+*.deb
+*.snap
+/etc/hiro/config.toml
+/var/lib/hiro/

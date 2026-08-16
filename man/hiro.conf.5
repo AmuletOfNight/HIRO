@@ -1,0 +1,39 @@
+.TH HIRO.CONF 5 "August 2026" "HIRO" "File Formats"
+.SH NAME
+hiro.conf \- HIRO daemon configuration
+.SH SYNOPSIS
+.I /etc/hiro/config.toml
+.SH DESCRIPTION
+TOML configuration for \fBhirod\fR(8). Every key is optional; missing
+values fall back to the built-in defaults (see
+.I /etc/hiro/config.toml.example
+for the complete set with documentation).
+.SH SECTIONS
+.TP
+.B [device]
+Camera node selection (\fIpath\fR), IR-only enforcement (\fIrequire_ir\fR),
+emitter mode, stream warm-up period.
+.TP
+.B [camera]
+Capture geometry: \fIwidth\fR, \fIheight\fR, \fIfps\fR, \fIpixel_format\fR
+(YUYV recommended), \fImax_frames\fR per attempt.
+.TP
+.B [recognition]
+Model directory, detector/embedder names, match threshold, quorum, timeout,
+liveness thresholds, and enrollment quality gates.
+.TP
+.B [security]
+Rate limiting, lockout, per-user template limit, camera-pinning policy.
+.TP
+.B [storage]
+Template database and encryption key paths.
+.TP
+.B [daemon]
+Socket path, log level, audit toggle, maximum per-request timeout.
+.SH RELOADING
+Apply changes with:
+.B hiro reload
+(the daemon rebuilds the pipeline when the recognition section changes).
+.SH SEE ALSO
+.BR hirod (8),
+.BR hiro (1)

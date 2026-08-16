@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hiro-core",
+    "crates/hiro-hw",
+    "crates/hiro-face",
+    "crates/hiro-store",
+    "crates/hiro-tpm",
+    "crates/hirod",
+    "crates/pam-hiro",
+    "crates/hiro-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/hiro-auth/hiro"
+
+[workspace.dependencies]
+hiro-core = { path = "crates/hiro-core" }
+hiro-hw = { path = "crates/hiro-hw" }
+hiro-face = { path = "crates/hiro-face" }
+hiro-store = { path = "crates/hiro-store" }
+hiro-tpm = { path = "crates/hiro-tpm" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+subtle = "2"
+sha2 = "0.10"
+aes-gcm = "0.10"
+nix = { version = "0.29", features = ["user", "fs", "ioctl", "socket"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

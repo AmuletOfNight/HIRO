@@ -1,0 +1,53 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME ?= $(CURDIR)/.cargo
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --features hiro-face/onnx,hiro-tpm/tpm
+
+override_dh_auto_test:
+	cargo test --workspace
+	cargo test -p hiro-face --features onnx
+	cargo test -p hiro-tpm --features tpm
+
+override_dh_auto_install:
+	# Daemon, CLI, PAM module
+	install -Dm755 target/release/hirod $(DESTDIR)/usr/sbin/hirod
+	install -Dm755 target/release/hiro $(DESTDIR)/usr/bin/hiro
+	install -Dm755 target/release/libpam_hiro.so \
+		$(DESTDIR)/lib/$$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security/pam_hiro.so
+	# Config + quirks
+	install -Dm644 etc/hiro/config.toml.example $(DESTDIR)/etc/hiro/config.toml.example
+	install -Dm644 crates/hiro-hw/quirks.toml $(DESTDIR)/etc/hiro/quirks.toml
+	# Systemd units
+	install -Dm644 packaging/systemd/hirod.service $(DESTDIR)/lib/systemd/system/hirod.service
+	install -Dm644 packaging/systemd/hirod-resume.service $(DESTDIR)/lib/systemd/system/hirod-resume.service
+	# udev rule
+	install -Dm644 packaging/udev/99-hiro.rules $(DESTDIR)/usr/lib/udev/rules.d/99-hiro.rules
+	# PAM profile (pam-auth-update)
+	install -Dm644 packaging/pam-configs/hiro $(DESTDIR)/usr/share/pam-configs/hiro
+	# polkit >= 127 helper drop-in (installed as a snippet, applied by postinst)
+	install -Dm644 packaging/polkit/hiro.conf $(DESTDIR)/usr/share/hiro/polkit-agent-helper-hiro.conf
+	# GNOME Shell status extension
+	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/metadata.json \
+		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/metadata.json
+	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/extension.js \
+		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/extension.js
+	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css \
+		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/stylesheet.css
+	# Model fetch script + manifest
+	install -Dm755 scripts/fetch-models.sh $(DESTDIR)/usr/share/hiro/fetch-models.sh
+	install -Dm644 crates/hiro-face/models/manifest.toml $(DESTDIR)/usr/share/hiro/models/manifest.toml
+	# Man pages
+	install -Dm644 man/hiro.1 $(DESTDIR)/usr/share/man/man1/hiro.1
+	install -Dm644 man/hirod.8 $(DESTDIR)/usr/share/man/man8/hirod.8
+	install -Dm644 man/pam_hiro.8 $(DESTDIR)/usr/share/man/man8/pam_hiro.8
+	install -Dm644 man/hiro.conf.5 $(DESTDIR)/usr/share/man/man5/hiro.conf.5
+	# Docs
+	install -Dm644 README.md $(DESTDIR)/usr/share/doc/hiro/README.md
+	install -Dm644 docs/security.md $(DESTDIR)/usr/share/doc/hiro/security.md
+	install -Dm644 docs/hardware.md $(DESTDIR)/usr/share/doc/hiro/hardware.md
+	install -Dm644 docs/pam.md $(DESTDIR)/usr/share/doc/hiro/pam.md

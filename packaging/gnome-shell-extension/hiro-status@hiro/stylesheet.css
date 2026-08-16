@@ -1,0 +1,29 @@
+/* HIRO face-auth status indicator styles */
+.hiro-status-overlay {
+    background-color: rgba(0, 0, 0, 0.55);
+    border-radius: 24px;
+    padding: 16px 24px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+}
+.hiro-status-box {
+    spacing: 14px;
+}
+.hiro-status-label {
+    font-size: 18px;
+    font-weight: bold;
+}
+.hiro-scanning {
+    color: #ffd166;
+}
+.hiro-ok .hiro-status-label {
+    color: #66bb6a;
+}
+.hiro-ok {
+    color: #66bb6a;
+}
+.hiro-fail .hiro-status-label {
+    color: #e57373;
+}
+.hiro-fail {
+    color: #e57373;
+}

@@ -1,0 +1,13 @@
+[package]
+name = "hiro-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encrypted face-template persistence (SQLite) for HIRO"
+
+[dependencies]
+hiro-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }

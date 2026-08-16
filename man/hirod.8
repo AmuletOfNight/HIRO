@@ -1,0 +1,47 @@
+.TH HIROD 8 "August 2026" "HIRO" "System Administration"
+.SH NAME
+hirod \- HIRO face-authentication daemon
+.SH SYNOPSIS
+.B hirod
+[\fB\-\-config\fR \fIPATH\fR]
+[\fB\-\-init-keys\fR]
+[\fB\-\-prewarm\fR]
+.SH DESCRIPTION
+\fBhirod\fR owns the IR camera, the ONNX face models, and the encrypted
+template store. It serves the PAM module and the \fBhiro\fR(1) CLI over a
+Unix socket (default \fI/run/hirod/hirod.sock\fR) and enforces rate limits,
+lockouts, camera pinning, and audit logging.
+.PP
+The daemon must run as root. Start it via systemd:
+.B systemctl start hirod
+.SH OPTIONS
+.TP
+.B --config PATH
+Configuration file (default \fI/etc/hiro/config.toml\fR).
+.TP
+.B --init-keys
+Create the encryption key file and template database, then exit. Run once
+after installation.
+.TP
+.B --prewarm
+Warm the models and camera, then exit (install-time check).
+.SH FILES
+.TP
+.I /etc/hiro/config.toml
+Configuration (see \fBhiro.conf\fR(5)).
+.TP
+.I /var/lib/hiro/templates.db
+Encrypted template store (SQLite).
+.TP
+.I /var/lib/hiro/hiro.key
+AES-256 data key, root-only.
+.TP
+.I /usr/share/hiro/models
+ONNX model files.
+.SH AUDIT
+Every verdict is logged to the journal under the \fIhiro_audit\fR target:
+.B journalctl -t hirod -g hiro_audit
+.SH SEE ALSO
+.BR hiro (1),
+.BR pam_hiro (8),
+.BR hiro.conf (5)

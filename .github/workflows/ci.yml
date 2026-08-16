@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install TPM2 build deps
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-deps
+      - name: Tests
+        run: cargo test --workspace
+      - name: ONNX pipeline tests
+        run: cargo test -p hiro-face --features onnx
+      - name: TPM module tests
+        run: cargo test -p hiro-tpm --features tpm

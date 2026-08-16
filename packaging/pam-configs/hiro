@@ -1,0 +1,6 @@
+Name: HIRO face authentication
+Default: yes
+Priority: 300
+Auth-Type: Primary
+Auth:
+	sufficient pam_hiro.so
