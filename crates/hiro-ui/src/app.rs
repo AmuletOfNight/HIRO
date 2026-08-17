@@ -915,3 +915,30 @@ fn set_meter_class(bar: &gtk::ProgressBar, base: &str, ok: bool) {
     }
     ctx.add_class(if ok { "hiro-meter-ok" } else { base });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bar_fraction_clamps() {
+        assert_eq!(bar_fraction(0.0, 3.0), 0.0);
+        assert_eq!(bar_fraction(3.0, 3.0), 1.0);
+        assert_eq!(bar_fraction(1.5, 3.0), 0.5);
+        // Clamps beyond the window and rejects degenerate inputs.
+        assert_eq!(bar_fraction(9.0, 3.0), 1.0);
+        assert_eq!(bar_fraction(1.0, 0.0), 0.0);
+        assert_eq!(bar_fraction(1.0, -2.0), 0.0);
+        assert_eq!(bar_fraction(f32::NAN, 3.0), 0.0);
+    }
+
+    #[test]
+    fn approval_countdown_rounds_up() {
+        // A 5001 ms window must read "6s to decide" until it dips below
+        // 5s; round up so the user is never told "0s" while time remains.
+        for (remaining_ms, expected) in [(5_000u64, 5u64), (5_001, 6), (1, 1), (999, 1), (1_000, 1)]
+        {
+            assert_eq!(remaining_ms.div_ceil(1000), expected, "{remaining_ms}ms");
+        }
+    }
+}

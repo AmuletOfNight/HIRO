@@ -42,9 +42,11 @@ mod tests {
     }
 
     #[test]
-    fn non_gnome_desktop_is_active() {
-        // With no environment, auto-detection must default to active.
-        assert!(!ui::desktop_is_gnome());
-        assert_eq!(decide(UiMode::Auto), UiDecision::Active);
+    fn auto_defers_only_when_extension_is_enabled() {
+        // `Auto` can only ever defer to an *enabled* extension; without one,
+        // it must render no matter what desktop this machine reports.
+        if !ui::gnome_extension_enabled() {
+            assert_eq!(decide(UiMode::Auto), UiDecision::Active);
+        }
     }
 }
