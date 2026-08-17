@@ -340,6 +340,77 @@ pub extern "C" fn pam_sm_acct_mgmt(
     PAM_SUCCESS
 }
 
+/// Tell `hirod` that `user` just logged in, so face auth arms for them
+/// until the next reboot. Best-effort and intentionally side-effect free:
+/// any failure is swallowed, and the session always opens.
+fn notify_login(opts: &ModuleOptions, user: &str, service: &str) {
+    let mut stream = match UnixStream::connect(&opts.socket) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let req = Request {
+        v: PROTOCOL_VERSION,
+        id: 0,
+        op: Op::Login {
+            user: user.into(),
+            service: service.into(),
+        },
+    };
+    let mut line = match serde_json::to_string(&req) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    line.push('\n');
+    if stream.write_all(line.as_bytes()).is_err() {
+        return;
+    }
+    // Consume the daemon's reply so the connection completes cleanly; the
+    // outcome is intentionally ignored (fail-open).
+    let _ = read_line(&mut stream, 2_000);
+}
+
+fn open_session_impl(pamh: *const PamHandle, argc: c_int, argv: *const *const c_char) -> c_int {
+    let opts = parse_options(argc, argv);
+    let Some(user) = pam_item_string(pamh, PAM_USER) else {
+        return PAM_SUCCESS;
+    };
+    let service = pam_item_string(pamh, PAM_SERVICE).unwrap_or_else(|| "unknown".into());
+    if opts.debug {
+        log(
+            pamh,
+            &opts,
+            LOG_DEBUG,
+            &format!("hiro: recording login for {user} via {}", opts.socket),
+        );
+    }
+    notify_login(&opts, &user, &service);
+    PAM_SUCCESS
+}
+
+/// Session open: a login completed successfully (after this, the PAM auth
+/// stack has accepted the user's credentials). Report it to `hirod` so the
+/// after-reboot gate arms face auth for this user until the next boot.
+#[no_mangle]
+pub extern "C" fn pam_sm_open_session(
+    pamh: *const PamHandle,
+    flags: c_int,
+    argc: c_int,
+    argv: *const *const c_char,
+) -> c_int {
+    let _ = flags;
+    std::panic::catch_unwind(|| open_session_impl(pamh, argc, argv)).unwrap_or(PAM_SUCCESS)
+}
+
+#[no_mangle]
+pub extern "C" fn pam_sm_close_session(
+    _pamh: *const PamHandle,
+    _flags: c_int,
+    _argc: c_int,
+    _argv: *const *const c_char,
+) -> c_int {
+    PAM_SUCCESS
+}
+
 #[no_mangle]
 pub extern "C" fn pam_sm_chauthtok(
     _pamh: *const PamHandle,

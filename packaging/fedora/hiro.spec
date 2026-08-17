@@ -31,6 +31,9 @@ cargo build --release --features hiro-face/onnx,hiro-tpm/tpm
 install -Dm755 target/release/hirod %{buildroot}%{_sbindir}/hirod
 install -Dm755 target/release/hiro %{buildroot}%{_bindir}/hiro
 install -Dm755 target/release/libpam_hiro.so %{buildroot}%{_libdir}/security/pam_hiro.so
+# Keep the secure-approval dialog at a distro-independent path so the
+# daemon's default approval.secure_dialog setting works everywhere.
+install -Dm755 target/release/hiro-approve %{buildroot}%{_prefix}/lib/hiro/hiro-approve
 
 install -Dm644 etc/hiro/config.toml.example %{buildroot}%{_sysconfdir}/hiro/config.toml.example
 install -Dm644 crates/hiro-hw/quirks.toml %{buildroot}%{_sysconfdir}/hiro/quirks.toml
@@ -68,6 +71,7 @@ install -Dm644 man/hiro.conf.5 %{buildroot}%{_mandir}/man5/hiro.conf.5
 %{_sbindir}/hirod
 %{_bindir}/hiro
 %{_libdir}/security/pam_hiro.so
+%{_prefix}/lib/hiro/hiro-approve
 %dir %{_sysconfdir}/hiro
 %config(noreplace) %{_sysconfdir}/hiro/config.toml.example
 %config(noreplace) %{_sysconfdir}/hiro/quirks.toml

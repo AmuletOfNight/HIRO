@@ -56,6 +56,9 @@ fn build_daemon() -> (Arc<Daemon>, tempfile::TempDir) {
     // The deterministic mock's landmark motion is marginal across repeated
     // verifies; these tests exercise the IPC flow, not the anti-spoof gate.
     cfg.recognition.enable_liveness = false;
+    // The action-approval gate is on by default; these tests exercise the
+    // instant-match IPC flow (see approval_flow_over_socket for the gate).
+    cfg.approval.enabled = false;
 
     let daemon = Daemon::build(
         cfg,
@@ -110,6 +113,29 @@ impl Client {
     }
 }
 
+/// Record a login for `user` over the socket, exactly like `pam_hiro.so`'s
+/// session hook does after a successful password login. Arms face auth for
+/// the current boot (the after-reboot gate).
+fn arm_login_over_socket(client: &mut Client, socket: &std::path::Path, user: &str) {
+    let resp = client.call(
+        socket,
+        Op::Login {
+            user: user.into(),
+            service: "ipc-login".into(),
+        },
+    );
+    assert!(
+        matches!(
+            resp.outcome,
+            Outcome::Ok {
+                result: ResultValue::Login
+            }
+        ),
+        "login signal failed: {:?}",
+        resp.outcome
+    );
+}
+
 #[test]
 fn full_cycle_over_socket() {
     let (daemon, dir) = build_daemon();
@@ -133,6 +159,10 @@ fn full_cycle_over_socket() {
             result: ResultValue::Pong { .. }
         }
     ));
+
+    // Simulate the user's password login since boot (PAM session hook),
+    // arming face auth for the rest of this boot.
+    arm_login_over_socket(&mut client, &socket, &user);
 
     // No templates yet -> fast no_templates verdict.
     let resp = client.call(
@@ -280,6 +310,8 @@ fn watch_streams_state_events() {
     // Trigger a verify (fails fast: no templates).
     let user = current_user();
     let mut client = Client::new();
+    // Arm face auth for this boot first (as a real password login would).
+    arm_login_over_socket(&mut client, &socket, &user);
     let resp = client.call(
         &socket,
         Op::Verify {
@@ -362,6 +394,7 @@ fn enroll_streams_enrollment_events() {
     }
     let user = current_user();
     let mut client = Client::new();
+    arm_login_over_socket(&mut client, &socket, &user);
     let resp = client.call(
         &socket,
         Op::Enroll {
@@ -377,10 +410,12 @@ fn enroll_streams_enrollment_events() {
     }
 
     // The stream must show an op=enroll scanning event with live progress
-    // and a terminal success event carrying the added/rejected counts so
-    // the status indicator can report the enrollment result.
+    // (accepted/target), live rejection telemetry with a reason code, and a
+    // terminal success event carrying the added/rejected counts so the
+    // status indicator can report the enrollment result.
     let mut saw_enrolling = false;
     let mut saw_progress = false;
+    let mut saw_rejection = false;
     let mut saw_terminal = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline && !saw_terminal {
@@ -395,6 +430,16 @@ fn enroll_streams_enrollment_events() {
             saw_enrolling = true;
             if val["accepted"].is_number() && val["target"].is_number() {
                 saw_progress = true;
+            }
+            // The mock camera alternates noise and face frames, so frames
+            // are rejected; live rejection events must carry the count and a
+            // stable reason the UI can show ("move closer", "turn your
+            // head", ...).
+            if val["rejected"].is_number()
+                && val["rejected"].as_u64().unwrap_or(0) > 0
+                && val["reason"].is_string()
+            {
+                saw_rejection = true;
             }
         }
         if state == "success" && op == "enroll" {
@@ -411,6 +456,7 @@ fn enroll_streams_enrollment_events() {
     }
     assert!(saw_enrolling, "never saw an op=enroll scanning event");
     assert!(saw_progress, "never saw enroll progress fields");
+    assert!(saw_rejection, "never saw a live enrollment rejection event");
     assert!(saw_terminal, "never saw a terminal enroll success event");
 
     drop(stream);
@@ -453,6 +499,9 @@ fn keyring_flow_over_socket() {
 
     let user = current_user();
     let mut client = Client::new();
+
+    // A real login would have armed face auth for this boot already.
+    arm_login_over_socket(&mut client, &socket, &user);
 
     // Not armed yet.
     let resp = client.call(&socket, Op::KeyringStatus { user: user.clone() });
@@ -579,4 +628,435 @@ fn keyring_flow_over_socket() {
     let _ = dir;
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     server_thread.join().unwrap();
+}
+
+#[test]
+fn login_gate_blocks_verify_until_login_over_socket() {
+    let (daemon, dir) = build_daemon();
+    let socket = daemon.cfg.read().unwrap().daemon.socket_path.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_thread = {
+        let daemon = daemon.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || hirod::server::serve(daemon, shutdown).unwrap())
+    };
+
+    let user = current_user();
+    let mut client = Client::new();
+
+    // Before any login since boot, verify is refused without scanning.
+    let resp = client.call(
+        &socket,
+        Op::Verify {
+            user: user.clone(),
+            service: "ipc-gate".into(),
+            timeout_ms: 1000,
+            want_keyring: false,
+        },
+    );
+    match resp.outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => {
+            assert!(!v.matched);
+            assert!(v.camera_ok, "gate must not blame the camera");
+            assert_eq!(v.reason, "password_required");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Enrollment is refused too.
+    let resp = client.call(
+        &socket,
+        Op::Enroll {
+            user: user.clone(),
+            max_models: 4,
+        },
+    );
+    assert!(
+        matches!(resp.outcome, Outcome::Err { .. }),
+        "enroll should be gated: {:?}",
+        resp.outcome
+    );
+
+    // After a login signal (as the PAM session hook sends), face auth arms.
+    arm_login_over_socket(&mut client, &socket, &user);
+    let resp = client.call(
+        &socket,
+        Op::Verify {
+            user: user.clone(),
+            service: "ipc-gate".into(),
+            timeout_ms: 1000,
+            want_keyring: false,
+        },
+    );
+    match resp.outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => {
+            assert!(!v.matched, "no templates yet");
+            assert_eq!(v.reason, "no_templates");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // An unauthorized caller cannot arm another user. (Skipped when the
+    // test itself runs as root, which may arm anyone.)
+    if !nix::unistd::geteuid().is_root() {
+        let resp = client.call(
+            &socket,
+            Op::Login {
+                user: "root".into(),
+                service: "ipc-gate".into(),
+            },
+        );
+        assert!(matches!(resp.outcome, Outcome::Err { .. }));
+    }
+
+    let _ = dir;
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server_thread.join().unwrap();
+}
+
+/// A daemon (with a real server thread) running with the approval gate
+/// enabled and one enrolled face, exactly as the action-approval feature
+/// expects: non-login services park after a confident match until an
+/// Allow/Disallow decision arrives.
+struct ApprovalEnv {
+    daemon: Arc<Daemon>,
+    _dir: tempfile::TempDir,
+    socket: std::path::PathBuf,
+    shutdown: Arc<AtomicBool>,
+    server_thread: std::thread::JoinHandle<()>,
+    user: String,
+}
+
+fn start_approval_env(approval_timeout_ms: u64) -> ApprovalEnv {
+    let (daemon, dir) = build_daemon();
+    let socket = daemon.cfg.read().unwrap().daemon.socket_path.clone();
+    {
+        let mut cfg = daemon.cfg.write().unwrap();
+        cfg.approval.enabled = true;
+        cfg.approval.timeout_ms = approval_timeout_ms;
+    }
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_thread = {
+        let daemon = daemon.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || hirod::server::serve(daemon, shutdown).unwrap())
+    };
+
+    let user = current_user();
+    let mut client = Client::new();
+    arm_login_over_socket(&mut client, &socket, &user);
+    {
+        let mut cam = daemon.camera.lock().unwrap();
+        cam.set_mock_face_every(Some(3));
+    }
+    let resp = client.call(
+        &socket,
+        Op::Enroll {
+            user: user.clone(),
+            max_models: 4,
+        },
+    );
+    match resp.outcome {
+        Outcome::Ok {
+            result: ResultValue::Enroll(r),
+        } => assert!(r.added >= 1, "enroll failed: {:?}", r.reports),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    ApprovalEnv {
+        daemon,
+        _dir: dir,
+        socket,
+        shutdown,
+        server_thread,
+        user,
+    }
+}
+
+/// Open a `Op::Watch` subscription, consuming the initial idle event.
+fn open_watch(socket: &std::path::Path) -> (UnixStream, BufReader<UnixStream>) {
+    let mut stream = None;
+    for _ in 0..100 {
+        if let Ok(s) = UnixStream::connect(socket) {
+            stream = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut stream = stream.expect("socket");
+    let req = Request {
+        v: PROTOCOL_VERSION,
+        id: 99,
+        op: Op::Watch,
+    };
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    // Consume the initial idle event.
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    (stream, reader)
+}
+
+/// Read state events until the `approval_pending` event arrives, returning
+/// it so the caller can read the `approval_id` and `service`.
+fn wait_for_approval(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let mut ev = String::new();
+        if reader.read_line(&mut ev).unwrap_or(0) == 0 {
+            break;
+        }
+        let val: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        if val["state"].as_str() == Some("approval_pending") {
+            return val;
+        }
+    }
+    panic!("never saw an approval_pending event");
+}
+
+/// Read state events until the daemon reports the user stepped away
+/// (`approval_pending` with `user_present: false`).
+fn wait_for_user_absent(reader: &mut BufReader<UnixStream>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let mut ev = String::new();
+        if reader.read_line(&mut ev).unwrap_or(0) == 0 {
+            break;
+        }
+        let val: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        if val["state"].as_str() == Some("approval_pending")
+            && val["user_present"].as_bool() == Some(false)
+        {
+            return;
+        }
+    }
+    panic!("never saw the user step away (user_present: false)");
+}
+
+/// Fire a `sudo`-style verify in a background thread: the daemon parks it
+/// until the approval is decided, so the caller can drive the UI.
+fn verify_in_background(
+    socket: &std::path::Path,
+    user: &str,
+    service: &str,
+) -> std::thread::JoinHandle<Response> {
+    let socket = socket.to_path_buf();
+    let user = user.to_string();
+    let service = service.to_string();
+    std::thread::spawn(move || {
+        let mut c = Client::new();
+        c.call(
+            &socket,
+            Op::Verify {
+                user,
+                service,
+                timeout_ms: 5000,
+                want_keyring: false,
+            },
+        )
+    })
+}
+
+#[test]
+fn approval_grant_and_deny_over_socket() {
+    let env = start_approval_env(5000);
+    let socket = env.socket.clone();
+    let user = env.user.clone();
+
+    // Grant: the UI reads approval_pending, clicks Allow, the parked
+    // verify completes as a match.
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let ev = wait_for_approval(&mut reader);
+    assert_eq!(ev["service"].as_str(), Some("ipc-sudo"));
+    assert_eq!(ev["user"].as_str(), Some(user.as_str()));
+    let approval_id = ev["approval_id"].as_u64().expect("approval_id");
+    let mut decider = Client::new();
+    let resp = decider.call(
+        &socket,
+        Op::Approve {
+            approval_id,
+            user: user.clone(),
+            allow: true,
+        },
+    );
+    assert!(
+        matches!(
+            resp.outcome,
+            Outcome::Ok {
+                result: ResultValue::Approved
+            }
+        ),
+        "approve failed: {:?}",
+        resp.outcome
+    );
+    match vt.join().unwrap().outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => assert!(v.matched, "grant should match: {v:?}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    drop(stream);
+
+    // Deny: a fresh request, clicked Deny -> clean non-match.
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let ev = wait_for_approval(&mut reader);
+    let approval_id = ev["approval_id"].as_u64().expect("approval_id");
+    let resp = decider.call(
+        &socket,
+        Op::Approve {
+            approval_id,
+            user: user.clone(),
+            allow: false,
+        },
+    );
+    assert!(matches!(
+        resp.outcome,
+        Outcome::Ok {
+            result: ResultValue::Approved
+        }
+    ));
+    match vt.join().unwrap().outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => {
+            assert!(!v.matched, "denial must fail: {v:?}");
+            assert_eq!(v.reason, "approval_denied");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    drop(stream);
+
+    env.shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    env.server_thread.join().unwrap();
+}
+
+#[test]
+fn approval_times_out_over_socket() {
+    let env = start_approval_env(250);
+    let socket = env.socket.clone();
+    let user = env.user.clone();
+
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let _ = wait_for_approval(&mut reader);
+    // Never decide: the daemon's window expires on its own.
+    match vt.join().unwrap().outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => {
+            assert!(!v.matched, "undecided approval must fail: {v:?}");
+            assert_eq!(v.reason, "approval_timeout");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    drop(stream);
+
+    env.shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    env.server_thread.join().unwrap();
+}
+
+#[test]
+fn approval_walks_away_then_times_out_over_socket() {
+    let env = start_approval_env(500);
+    // The mock emits a face every 3rd frame, so right after the match the
+    // camera shows two consecutive noise frames. With absent_frames = 2
+    // the daemon detects the user stepping away almost immediately: the
+    // buttons must disappear (user_present: false) but the request must
+    // keep waiting until the window expires.
+    env.daemon.cfg.write().unwrap().approval.absent_frames = 2;
+    let socket = env.socket.clone();
+    let user = env.user.clone();
+
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let ev = wait_for_approval(&mut reader);
+    assert_eq!(ev["user_present"].as_bool(), Some(true));
+    wait_for_user_absent(&mut reader);
+    match vt.join().unwrap().outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => {
+            assert!(!v.matched, "walk-away must run out the window: {v:?}");
+            assert_eq!(v.reason, "approval_timeout");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    drop(stream);
+
+    env.shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    env.server_thread.join().unwrap();
+}
+
+#[test]
+fn approve_requires_authorization_over_socket() {
+    let env = start_approval_env(5000);
+    let socket = env.socket.clone();
+    let user = env.user.clone();
+
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let ev = wait_for_approval(&mut reader);
+    let approval_id = ev["approval_id"].as_u64().expect("approval_id");
+
+    // An unknown approval id is rejected.
+    let mut decider = Client::new();
+    let resp = decider.call(
+        &socket,
+        Op::Approve {
+            approval_id: approval_id + 10_000,
+            user: user.clone(),
+            allow: true,
+        },
+    );
+    assert!(matches!(resp.outcome, Outcome::Err { .. }));
+
+    // A wrong user name is rejected even though the caller is the daemon
+    // socket owner (authorization is against the pending request's user).
+    let resp = decider.call(
+        &socket,
+        Op::Approve {
+            approval_id,
+            user: "root".into(),
+            allow: true,
+        },
+    );
+    assert!(matches!(resp.outcome, Outcome::Err { .. }));
+
+    // The right user works, and the parked verify completes.
+    let resp = decider.call(
+        &socket,
+        Op::Approve {
+            approval_id,
+            user: user.clone(),
+            allow: true,
+        },
+    );
+    assert!(matches!(
+        resp.outcome,
+        Outcome::Ok {
+            result: ResultValue::Approved
+        }
+    ));
+    match vt.join().unwrap().outcome {
+        Outcome::Ok {
+            result: ResultValue::Verify(v),
+        } => assert!(v.matched, "grant should match: {v:?}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    drop(stream);
+
+    env.shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    env.server_thread.join().unwrap();
 }

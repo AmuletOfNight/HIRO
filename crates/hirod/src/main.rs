@@ -92,6 +92,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Secure-desktop mode depends on the hiro-approve helper. Warn loudly at
+    // startup (not just at each approval) when it is missing, otherwise every
+    // approval silently times out with no visible prompt.
+    if cfg.approval.secure_desktop && !cfg.approval.secure_dialog.exists() {
+        eprintln!(
+            "warning: approval.secure_desktop is enabled but the dialog helper {} does not exist",
+            cfg.approval.secure_dialog.display()
+        );
+        eprintln!(
+            "         approval prompts will time out unseen; install it with `sudo ./scripts/redeploy.sh`"
+        );
+    }
+
     let key_manager = match hiro_tpm::load(&cfg.storage.key_path) {
         Ok(km) => km,
         Err(e) => {

@@ -51,12 +51,17 @@ it.
 
 ## Manual integration (any distro)
 
-Add as the **first** `auth` line of the PAM service you want:
+Add as the **first** `auth` line of the PAM service you want, plus the
+session line (needed for the after-reboot password gate to arm — see
+below):
 
 ```bash
 # sudo /etc/pam.d/sudo
 auth    sufficient    pam_hiro.so
 auth    include       system-auth
+
+# add to the session group of each login service (greeter, login, sshd, ...):
+session optional    pam_hiro.so
 ```
 
 Recommended services:
@@ -68,6 +73,37 @@ Recommended services:
 | `/etc/pam.d/login` | TTY login |
 | `/etc/pam.d/gdm` / `sddm` | greeter + lock screen |
 | `/etc/pam.d/polkit-1` | graphical authorization prompts |
+
+## Password required after reboot
+
+Like Windows Hello and macOS Touch ID, face auth is disabled until the
+account has been logged into since the last reboot
+(`security.require_password_after_boot`, default on). After boot the first
+login must use the password; that login arms face auth for the user for the
+rest of the boot. The arming signal comes from `pam_hiro.so`'s session
+hook (`session optional pam_hiro.so`), which reports the login to `hirod`.
+The packaged pam-auth-update profile includes the hook; manual setups must
+add the session line or face auth stays off after every reboot (set
+`require_password_after_boot = false` to disable the gate entirely).
+
+## Action approval for non-login services
+
+By default (`[approval] enabled = true`), a face match alone is not enough
+to authorize requests from *non-login* services: after a confident match,
+`hirod` parks the request and asks for an explicit **Allow** / **Deny**
+decision (shown by the status indicator, or on the secure console with
+`approval.secure_desktop = true`). Login screens and `hiro test` bypass the
+prompt because you trigger those yourself.
+
+The PAM module simply waits for `hirod`'s final verdict, so nothing about
+the PAM stack changes — `sudo`, `su`, and polkit keep the exact same
+`auth sufficient pam_hiro.so` lines. The "sudo hangs briefly" behaviour is
+now intentional: the extra delay is the decision window
+(`approval.timeout_ms`, default 5 s). If you want instant matches
+everywhere again, set `[approval] enabled = false` and restart `hirod`.
+
+See `docs/security.md` ("Action approval gate") for the full behaviour and
+the walk-away/timeout rules.
 
 ## polkit >= 127
 

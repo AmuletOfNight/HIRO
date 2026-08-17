@@ -14,11 +14,12 @@ override_dh_auto_test:
 	cargo test -p hiro-tpm --features tpm
 
 override_dh_auto_install:
-	# Daemon, CLI, PAM module
+	# Daemon, CLI, PAM module, secure-approval dialog
 	install -Dm755 target/release/hirod $(DESTDIR)/usr/sbin/hirod
 	install -Dm755 target/release/hiro $(DESTDIR)/usr/bin/hiro
 	install -Dm755 target/release/libpam_hiro.so \
 		$(DESTDIR)/lib/$$(dpkg-architecture -qDEB_HOST_MULTIARCH)/security/pam_hiro.so
+	install -Dm755 target/release/hiro-approve $(DESTDIR)/usr/lib/hiro/hiro-approve
 	# Config + quirks
 	install -Dm644 etc/hiro/config.toml.example $(DESTDIR)/etc/hiro/config.toml.example
 	install -Dm644 crates/hiro-hw/quirks.toml $(DESTDIR)/etc/hiro/quirks.toml

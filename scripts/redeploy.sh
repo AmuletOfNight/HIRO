@@ -9,6 +9,7 @@
 #
 # Installs to the same paths as the .deb produced by packaging/build-deb.sh:
 #   /usr/sbin/hirod   /usr/bin/hiro   pam_hiro.so
+#   /usr/lib/hiro/hiro-approve  (secure-desktop approval dialog)
 #   /etc/hiro/config.toml(.example)   /etc/hiro/quirks.toml
 #   systemd units + udev rule + pam-config profile + polkit drop-in
 #   GNOME Shell extension  /usr/share/gnome-shell/extensions/hiro-status@hiro
@@ -137,6 +138,10 @@ echo "== installing binaries (PAM module -> $PAM_DIR) =="
 install -Dm755 "$REPO/target/release/hirod"          /usr/sbin/hirod
 install -Dm755 "$REPO/target/release/hiro"           /usr/bin/hiro
 install -Dm755 "$REPO/target/release/libpam_hiro.so" "$PAM_DIR/pam_hiro.so"
+# Secure-desktop approval dialog — the daemon spawns this via systemd-run
+# when approval.secure_desktop = true. Default approval.secure_dialog
+# points here, so keep the path in sync with crates/hiro-core config.rs.
+install -Dm755 "$REPO/target/release/hiro-approve"   /usr/lib/hiro/hiro-approve
 
 echo "== installing configuration =="
 mkdir -p /etc/hiro

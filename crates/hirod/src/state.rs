@@ -1,7 +1,10 @@
 //! Shared daemon state.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use hiro_core::Config;
 use hiro_face::FacePipeline;
@@ -29,6 +32,31 @@ impl PasswordChecker for ShadowPasswordChecker {
     }
 }
 
+/// Which users may use face auth since the current boot.
+///
+/// Mirrors `security.require_password_after_boot`: a user is only allowed
+/// to authenticate (or enroll) once they have logged in during the current
+/// boot. State is persisted in the store keyed by the kernel boot id, so
+/// daemon restarts mid-boot keep the armed set.
+pub struct BootAuth {
+    pub boot_id: String,
+    pub logged_in: HashSet<String>,
+}
+
+/// A request awaiting an explicit Allow/Disallow decision after a confident
+/// face match (the action-approval gate).
+pub struct PendingApproval {
+    pub id: u64,
+    pub user: String,
+    pub service: String,
+    /// Best match score observed before the prompt appeared.
+    pub score: f32,
+    /// `None` until the user (or their status indicator) decides via
+    /// `Op::Approve`; then `Some(allow)`.
+    pub decided: Option<bool>,
+    pub created: Instant,
+}
+
 /// Everything a request handler needs. Cheap to clone: the heavy pieces
 /// live behind locks.
 pub struct Daemon {
@@ -43,6 +71,13 @@ pub struct Daemon {
     pub password_checker: Box<dyn PasswordChecker>,
     /// Subscribers to authentication state events (`Op::Watch`).
     pub watchers: Mutex<Vec<Sender<String>>>,
+    /// Users who have logged in since the last reboot (after-reboot gate).
+    pub boot_auth: Mutex<BootAuth>,
+    /// Pending action approvals awaiting an Allow/Disallow decision, keyed
+    /// by approval id (`Op::Approve`).
+    pub approvals: Mutex<HashMap<u64, PendingApproval>>,
+    /// Monotonic source of approval ids.
+    pub next_approval_id: AtomicU64,
     pub config_path: Option<std::path::PathBuf>,
     pub started_at: std::time::Instant,
 }
@@ -102,6 +137,20 @@ impl Daemon {
             opts.camera_source,
         )));
         let policy = Policy::new(cfg.security.clone());
+
+        // Seed the after-reboot gate from the store: a fresh boot id prunes
+        // every stale record (no user is armed), while a daemon restart
+        // within the same boot keeps the users who already logged in.
+        let boot_id = crate::boot::current_boot_id();
+        store
+            .prune_boot_auth(&boot_id)
+            .map_err(|e| format!("cannot prune stale boot-auth records: {e}"))?;
+        let logged_in = store
+            .boot_auth_users(&boot_id)
+            .map_err(|e| format!("cannot load boot-auth state: {e}"))?
+            .into_iter()
+            .collect::<HashSet<_>>();
+
         Ok(Arc::new(Daemon {
             cfg: RwLock::new(cfg),
             store: Mutex::new(store),
@@ -111,6 +160,9 @@ impl Daemon {
             policy: Mutex::new(policy),
             password_checker,
             watchers: Mutex::new(Vec::new()),
+            boot_auth: Mutex::new(BootAuth { boot_id, logged_in }),
+            approvals: Mutex::new(HashMap::new()),
+            next_approval_id: AtomicU64::new(1),
             config_path: opts.config_path,
             started_at: std::time::Instant::now(),
         }))

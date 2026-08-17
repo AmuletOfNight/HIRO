@@ -44,7 +44,31 @@ liveness_min_motion = 0.002
 # Enrollment quality gates.
 min_face_area = 0.02
 min_sharpness = 5.0
-dedupe_threshold = 0.55
+# Only reject an enrollment frame as a "duplicate pose" when it is MORE
+# similar than this to an already-stored template. Keep this lenient: a
+# real face at different angles scores ~0.7-0.9 similarity (higher on IR).
+# 0.55 rejects almost every frame unless you make extreme pose changes.
+dedupe_threshold = 0.85
+# Enrollment static-scene gate. 0 (default) lets the user hold a pose for a
+# sharp capture — enrollment does not need the anti-spoof motion gate that
+# verification uses. A positive value requires frame-to-frame motion and
+# skips the face pipeline entirely on static frames.
+enroll_min_variance = 0.0
+# Automatic per-user match-threshold calibration. When on, `hiro enroll`
+# measures your genuine match scores in a short calibration pass and stores
+# a per-user threshold; verification uses that threshold instead of
+# match_threshold. Each successful match slowly adapts it toward the
+# observed score (never on failures). Set false to rely on the global
+# match_threshold alone.
+auto_threshold = true
+# Margin subtracted from the measured genuine scores when calibrating.
+auto_threshold_margin = 0.05
+# Hard floor for calibrated/adapted thresholds (security lower bound).
+auto_threshold_min = 0.50
+# Hard ceiling for calibrated/adapted thresholds.
+auto_threshold_max = 0.90
+# EMA rate per successful match (0.0 disables adaptive tracking).
+auto_threshold_adapt = 0.02
 
 [security]
 rate_limit_attempts = 5
@@ -53,6 +77,12 @@ lockout_secs = 30
 max_templates_per_user = 16
 # Allow authenticating with a different camera than the enrolled one.
 allow_camera_change = false
+# Require a password login after every reboot before face authentication
+# is allowed for a user (Windows Hello / macOS Touch ID behaviour). The
+# first login of a boot arms face auth for that user until the next reboot;
+# `pam_hiro.so` reports it from its session hook. Set to false to let face
+# auth work immediately after boot without a prior password login.
+require_password_after_boot = true
 
 [storage]
 db_path = "/var/lib/hiro/templates.db"
@@ -79,3 +109,40 @@ enabled = false
 # PAM services whose stack ends in a keyring module (graphical greeters
 # and session logins). `sudo`/`su`/polkit do not unlock a keyring.
 services = ["gdm-password", "sddm", "lightdm", "lightdm-greeter", "login", "tty"]
+
+[approval]
+# Action-approval gate (on by default): when a NON-login service (sudo,
+# su, polkit, lock screen, ...) passes the face scan, the request pauses
+# for an explicit Allow/Disallow decision before it is granted. The prompt
+# is shown by the status indicator, or on a secure console when
+# secure_desktop is enabled. Set enabled = false to restore instant
+# matches everywhere.
+enabled = true
+# PAM services that skip the prompt because the user triggers the request
+# themselves: graphical greeters / session logins, and `hiro test`.
+bypass_services = ["gdm-password", "sddm", "lightdm", "lightdm-greeter", "login", "tty", "hiro-test"]
+# How long the user has to press Allow after the face meets the match
+# threshold. The prompt — and the ability to approve — disappears when this
+# expires (and while the user is detected as absent; it reappears if they
+# step back into the frame).
+timeout_ms = 5000
+# How far below the effective match threshold the live score must fall (for
+# absent_frames consecutive frames) before the user is treated as absent:
+# the Allow/Deny buttons disappear, but the request keeps waiting until
+# timeout_ms before it is denied, so the user can step back and still decide.
+absent_score_margin = 0.10
+# Consecutive frames with no convincing face (no detection, or a score
+# below absent_score_margin under the match threshold) before the prompt is
+# hidden. Roughly one second at 30 fps with the default. Unlike the
+# timeout, this never fails the request on its own.
+absent_frames = 30
+
+# Secure-desktop dialog (off by default): show the Allow/Deny prompt on a
+# dedicated VT ("secure console") via `hiro-approve` instead of the
+# in-session status indicator. The daemon must run as root (VT ioctls) and
+# spawns the helper outside its hardened systemd unit via `systemd-run`.
+secure_desktop = false
+# VT number the secure-desktop dialog switches to.
+secure_vt = 8
+# Path to the secure-desktop dialog helper.
+secure_dialog = "/usr/lib/hiro/hiro-approve"

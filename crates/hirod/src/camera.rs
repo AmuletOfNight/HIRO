@@ -290,8 +290,11 @@ mod tests {
         }
     }
 
-    fn session_with_fake_emitter(
-    ) -> (CameraSession, std::sync::Arc<std::sync::Mutex<usize>>, std::sync::Arc<std::sync::Mutex<usize>>) {
+    fn session_with_fake_emitter() -> (
+        CameraSession,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+    ) {
         let mut cfg = Config::default();
         cfg.camera.width = 64;
         cfg.camera.height = 48;
@@ -379,7 +382,13 @@ mod tests {
             if !self.started {
                 return Ok(None);
             }
-            Ok(Some(Frame::new(4, 4, hiro_hw::frame::PixelFormat::Gray8, vec![0u8; 16], 1)))
+            Ok(Some(Frame::new(
+                4,
+                4,
+                hiro_hw::frame::PixelFormat::Gray8,
+                vec![0u8; 16],
+                1,
+            )))
         }
         fn stop(&mut self) {
             self.started = false;

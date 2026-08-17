@@ -9,6 +9,7 @@ members = [
     "crates/hirod",
     "crates/pam-hiro",
     "crates/hiro-cli",
+    "crates/hiro-approve",
 ]
 
 [workspace.package]

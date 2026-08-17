@@ -3,6 +3,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod boot;
 pub mod camera;
 pub mod liveness;
 pub mod lookup;

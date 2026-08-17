@@ -3,6 +3,7 @@
 //! Requires `HIRO_MODELS_DIR` to point at a directory containing the
 //! manifest's model files (see scripts/fetch-models.sh). Runs only with
 //! `cargo test --features onnx -- --ignored onnx_smoke`.
+#![cfg(feature = "onnx")]
 
 use hiro_core::config::RecognitionConfig;
 
@@ -112,7 +113,7 @@ fn onnx_smoke() {
                 let scores: Vec<String> = stats.iter().map(|s| format!("{s:.3}")).collect();
                 println!("NORM {mode}: max-per-map=[{}]", scores.join(", "));
             }
-            let dets = raw.detect(&luma, pw, ph).expect("detect");
+            let dets = raw.detect_boxes(&luma, pw, ph).expect("detect");
             println!("detections:");
             for d in dets.iter().take(8) {
                 println!("  score={:.3} bbox={:?}", d.score, d.bbox);

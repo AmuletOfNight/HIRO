@@ -73,9 +73,30 @@ pub enum Op {
     },
     Reload,
     Prewarm,
+    /// Tell the daemon that `user` completed a successful login during this
+    /// boot. Sent by `pam_hiro.so`'s session hook after the auth stack
+    /// succeeded, so face auth arms for that user until the next reboot.
+    Login {
+        user: String,
+        /// PAM service that established the session, for audit.
+        service: String,
+    },
     /// Subscribe to authentication state events. The daemon keeps the
     /// connection open and streams newline-delimited [`StateEvent`] JSON.
     Watch,
+    /// Grant or deny a pending action approval (`state: "approval_pending"`
+    /// broadcast via `Op::Watch`). The `approval_id` comes from that
+    /// event's `approval_id` field; only the target user (or root) may
+    /// decide. Sent by the status indicator (or `hiro-approve` on the
+    /// secure console) when the user clicks Allow/Disallow.
+    Approve {
+        /// Approval id carried on the `approval_pending` StateEvent.
+        approval_id: u64,
+        /// The user the pending request belongs to (authorization check).
+        user: String,
+        /// `true` allows the action, `false` denies it.
+        allow: bool,
+    },
 }
 
 /// A response from the daemon.
@@ -117,19 +138,40 @@ pub enum Outcome {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResultValue {
-    Pong { daemon: String },
+    Pong {
+        daemon: String,
+    },
     Verify(VerifyResult),
     Enroll(EnrollResult),
     Status(StatusResult),
-    List { templates: Vec<TemplateInfo> },
-    Removed { id: i64 },
-    Cleared { count: usize },
-    Snapshot { path: String },
-    KeyringSet { stored: bool },
-    KeyringCleared { removed: bool },
-    KeyringStatus { enabled: bool, stored: bool },
+    List {
+        templates: Vec<TemplateInfo>,
+    },
+    Removed {
+        id: i64,
+    },
+    Cleared {
+        count: usize,
+    },
+    Snapshot {
+        path: String,
+    },
+    KeyringSet {
+        stored: bool,
+    },
+    KeyringCleared {
+        removed: bool,
+    },
+    KeyringStatus {
+        enabled: bool,
+        stored: bool,
+    },
     Reloaded,
     Prewarmed,
+    Login,
+    /// The daemon recorded an Allow/Disallow decision for a pending
+    /// approval (`Op::Approve`).
+    Approved,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +196,11 @@ pub struct VerifyResult {
     /// the daemon has the feature enabled, the service is listed, and the
     /// password still matches the account. `None` otherwise.
     pub keyring_password: Option<String>,
+    /// The match threshold actually applied for this attempt: the user's
+    /// auto-calibrated per-user value when available, else the global
+    /// `recognition.match_threshold`.
+    #[serde(default)]
+    pub threshold_used: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +209,11 @@ pub struct EnrollResult {
     pub rejected: usize,
     pub template_ids: Vec<i64>,
     pub reports: Vec<QualityReport>,
+    /// Per-user match threshold calibrated during this enrollment (present
+    /// when automatic calibration is enabled and enough samples were
+    /// captured).
+    #[serde(default)]
+    pub match_threshold: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +239,19 @@ pub struct StatusResult {
     pub templates: usize,
     pub tpm_available: Option<bool>,
     pub uptime_secs: u64,
+    /// Whether `security.require_password_after_boot` is enabled: face auth
+    /// only works for users who logged in since the last reboot.
+    #[serde(default)]
+    pub require_password_after_boot: bool,
+    /// Whether automatic per-user threshold calibration is enabled
+    /// (`recognition.auto_threshold`).
+    #[serde(default)]
+    pub auto_threshold: bool,
+    /// Whether the action-approval gate is enabled (`approval.enabled`):
+    /// non-login services pause for an explicit Allow/Disallow after a
+    /// confident face match.
+    #[serde(default)]
+    pub approval_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,7 +302,7 @@ pub struct CameraProbe {
 /// Authentication state broadcast to `Op::Watch` subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateEvent {
-    /// `idle`, `scanning`, `success`, or `failure`.
+    /// `idle`, `scanning`, `approval_pending`, `success`, or `failure`.
     pub state: String,
     /// Operation that produced this event: `verify` (the default) or
     /// `enroll`. Watchers use it to show distinct status text and result
@@ -267,6 +332,31 @@ pub struct StateEvent {
     /// Enrollment: number of frames rejected during the run (terminal event).
     #[serde(default)]
     pub rejected: Option<usize>,
+    /// The PAM service that initiated the request (e.g. "sudo"). Watchers
+    /// show it on the approval prompt.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Present while an action awaits approval: the id the status indicator
+    /// must echo in `Op::Approve` to grant or deny the request.
+    #[serde(default)]
+    pub approval_id: Option<u64>,
+    /// Present while an action awaits approval: the full decision window
+    /// (ms) the user has before the buttons disappear.
+    #[serde(default)]
+    pub approval_timeout_ms: Option<u64>,
+    /// Present while an action awaits approval: whether the decision is
+    /// shown on the secure console (`approval.secure_desktop`) rather than
+    /// in the session. The in-session indicator then shows a passive notice
+    /// instead of Allow/Deny buttons.
+    #[serde(default)]
+    pub secure: Option<bool>,
+    /// Present while an action awaits approval: whether the user is
+    /// currently in front of the camera. `false` means the user stepped
+    /// away — the indicator hides the Allow/Deny buttons (and shows them
+    /// again when the daemon broadcasts `true`), but the window stays open
+    /// until `approval_timeout_ms`.
+    #[serde(default)]
+    pub user_present: Option<bool>,
 }
 
 fn default_op() -> String {
@@ -288,6 +378,11 @@ impl StateEvent {
             accepted: None,
             target: None,
             rejected: None,
+            service: None,
+            approval_id: None,
+            approval_timeout_ms: None,
+            secure: None,
+            user_present: None,
         }
     }
 
@@ -305,6 +400,11 @@ impl StateEvent {
             accepted: None,
             target: None,
             rejected: None,
+            service: None,
+            approval_id: None,
+            approval_timeout_ms: None,
+            secure: None,
+            user_present: None,
         }
     }
 
@@ -323,6 +423,11 @@ impl StateEvent {
             accepted: Some(0),
             target: None,
             rejected: None,
+            service: None,
+            approval_id: None,
+            approval_timeout_ms: None,
+            secure: None,
+            user_present: None,
         }
     }
 }
@@ -330,6 +435,7 @@ impl StateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PROTOCOL_VERSION;
 
     #[test]
     fn verify_roundtrip() {
@@ -380,6 +486,119 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"op\":\"snapshot\""), "unexpected: {json}");
+    }
+
+    #[test]
+    fn login_ops_roundtrip() {
+        let json = serde_json::to_string(&Request {
+            v: PROTOCOL_VERSION,
+            id: 5,
+            op: Op::Login {
+                user: "alice".into(),
+                service: "gdm-password".into(),
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"op\":\"login\""), "{json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back.op {
+            Op::Login { user, service } => {
+                assert_eq!(user, "alice");
+                assert_eq!(service, "gdm-password");
+            }
+            _ => panic!("wrong op"),
+        }
+
+        let resp = Response::ok(5, ResultValue::Login);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"login\""), "{json}");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.outcome,
+            Outcome::Ok {
+                result: ResultValue::Login
+            }
+        ));
+    }
+
+    #[test]
+    fn approve_ops_roundtrip() {
+        let json = serde_json::to_string(&Request {
+            v: 1,
+            id: 11,
+            op: Op::Approve {
+                approval_id: 77,
+                user: "alice".into(),
+                allow: true,
+            },
+        })
+        .unwrap();
+        assert!(json.contains("\"op\":\"approve\""), "{json}");
+        assert!(json.contains("\"approval_id\":77"), "{json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back.op {
+            Op::Approve {
+                approval_id,
+                user,
+                allow,
+            } => {
+                assert_eq!(approval_id, 77);
+                assert_eq!(user, "alice");
+                assert!(allow);
+            }
+            _ => panic!("wrong op"),
+        }
+
+        let resp = Response::ok(11, ResultValue::Approved);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"type\":\"approved\""), "{json}");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back.outcome,
+            Outcome::Ok {
+                result: ResultValue::Approved
+            }
+        ));
+    }
+
+    #[test]
+    fn approval_pending_event_fields_roundtrip() {
+        let ev = StateEvent {
+            state: "approval_pending".into(),
+            op: "verify".into(),
+            user: Some("alice".into()),
+            score: Some(0.97),
+            reason: None,
+            variance: None,
+            motion: None,
+            min_variance: None,
+            min_motion: None,
+            accepted: None,
+            target: None,
+            rejected: None,
+            service: Some("sudo".into()),
+            approval_id: Some(7),
+            approval_timeout_ms: Some(5000),
+            secure: Some(false),
+            user_present: Some(true),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"state\":\"approval_pending\""), "{json}");
+        assert!(json.contains("\"service\":\"sudo\""), "{json}");
+        assert!(json.contains("\"approval_id\":7"), "{json}");
+        let back: StateEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.approval_id, Some(7));
+        assert_eq!(back.service.as_deref(), Some("sudo"));
+        assert_eq!(back.user_present, Some(true));
+
+        // Older daemons omit the new fields; watchers must accept that.
+        let legacy = r#"{"state":"scanning","op":"verify","user":"alice"}"#;
+        let back: StateEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.service, None);
+        assert_eq!(back.approval_id, None);
+        assert_eq!(back.approval_timeout_ms, None);
+        assert_eq!(back.secure, None);
+        assert_eq!(back.user_present, None);
     }
 
     #[test]

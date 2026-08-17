@@ -34,6 +34,47 @@ Thresholds: `recognition.liveness_min_variance` and
 `recognition.liveness_min_motion`. A failed gate yields `liveness_failed`
 regardless of embedding similarity (no oracle for attackers).
 
+Enrollment does **not** reuse these thresholds. Capturing templates is an
+authenticated, interactive operation (the user runs `hiro enroll`), so there
+is no photo-replay boundary to defend; requiring motion would just make it
+impossible to hold a pose long enough for a sharp, well-framed capture.
+Instead, enrollment applies its own quality gates (`min_face_area`,
+`min_sharpness`, `dedupe_threshold` for distinct poses, and an optional
+`recognition.enroll_min_variance` that defaults to 0 = off). When
+`enroll_min_variance` is set above zero, static frames are rejected before
+the face pipeline runs, both as a stall guard and as a CPU saving.
+
+`dedupe_threshold` is the "how different must the next pose be" knob, and it
+is intentionally lenient by default (0.85): faces of the same person at
+modest pose changes score 0.7–0.9 similarity, and even more on IR hardware
+due to the RGB→IR domain gap. Raising it makes enrollment accept more frames
+at the cost of more redundant templates; lowering it forces larger pose
+changes.
+
+### Per-user match-threshold calibration
+
+A single global `match_threshold` is a poor fit across users, cameras, and
+lighting: the same person's genuine scores shift with the RGB→IR domain gap
+and sensor. With `recognition.auto_threshold` (default on), each user gets
+their own threshold:
+
+- **At enrollment**, after templates are captured, a short live pass
+  measures the user's genuine match scores against their own templates. The
+  stored per-user threshold is the 25th percentile of those scores minus
+  `auto_threshold_margin`, clamped to `[auto_threshold_min,
+  auto_threshold_max]` (defaults 0.50–0.90). The floor keeps calibration
+  from ever demanding *less* than a conservative baseline; the ceiling keeps
+  it from requiring scores that real-world captures cannot reach.
+- **Adaptive tracking** nudges the threshold toward the observed score of
+  each *successful* match at the EMA rate `auto_threshold_adapt` (0.02 =
+  slow drift, 0 disables it). Adaptation runs **only on success**: a failed
+  attempt — including one crafted by an attacker — never moves the
+  threshold, so the calibration cannot be weakened by probing.
+- Verification uses the per-user threshold when present, else the global
+  `match_threshold`. `hiro test` prints the effective threshold and the best
+  score seen so you can observe the drift. Set `auto_threshold = false` to
+  fall back to the single global threshold for everyone.
+
 ### Camera pinning
 
 Enrollment records the camera's USB identity (vendor/product/bus/serial).
@@ -94,6 +135,74 @@ video4linux/usb character devices, `MemoryDenyWriteExecute`,
 `pam_hiro.so` maps every failure to password fallback
 (`PAM_AUTH_ERR` / `PAM_AUTHINFO_UNAVAIL`); a face mismatch can never
 block login, and the module itself performs no recognition.
+
+### Action approval gate
+
+By default, a confident face match only *authorizes* a request after the
+user explicitly allows it. This closes the "face scan happens in the
+background" hole: a site or process asking for `sudo` should not run
+silently just because the camera recognizes the user.
+
+- `approval.enabled` (default **true**) gates every service except
+  `approval.bypass_services` (default: graphical greeters / session
+  logins and `hiro test`). Login screens stay instant because the user
+  triggers them themselves.
+- On a match, `hirod` broadcasts `state: "approval_pending"` with the
+  requesting service, the match score, and an `approval_id`. The status
+  indicator shows **Allow** / **Deny**; the decision is sent back via the
+  `approve` IPC op, authorized to the target user (or root) only.
+- The request is **denied** only when the decision window
+  (`approval.timeout_ms`, default 5 s) expires, or when the user clicks
+  **Deny**. Stepping out of the frame is *not* a failure: after
+  `approval.absent_frames` consecutive frames with no convincing face
+  (`approval.absent_score_margin` below the effective match threshold),
+  the buttons disappear, but the request keeps waiting — the prompt
+  returns if the user steps back into the frame, and the request still
+  only fails when the window actually times out. The default debounce
+  (~30 frames ≈ 1 s at 30 fps) also stops a momentary detection blip from
+  hiding the prompt.
+- Verdicts are audited (`reason=approved|approval_denied|
+  approval_timeout`) and, like any non-match, count toward the per-user
+  failure/rate-limit counters.
+- With `approval.secure_desktop = true` (default **off**), the prompt is
+  rendered by the `hiro-approve` helper on a dedicated VT ("secure
+  console") instead of the in-session indicator, so a compromised user
+  session cannot fake or overlay the dialog. The daemon spawns the helper
+  outside its hardened unit via `systemd-run` (direct spawn as fallback),
+  which requires root and a VT console; the helper switches to the
+  configured VT (`approval.secure_vt`, default 8), shows a centered,
+  full-screen Allow/Deny prompt with large block-letter keys (Enter/Y or
+  Esc/N/Q) and a big countdown, sends the decision, and returns to the
+  previous VT. As with the in-session prompt, the dialog dismisses itself
+  when the daemon reports the user stepped away (`user_present: false`);
+  `hirod` re-opens it if the user steps back into the frame before the
+  window expires.
+
+### After-reboot password gate
+
+Like Windows Hello and macOS Touch ID, HIRO refuses face authentication
+until the account has been logged into since the last reboot
+(`security.require_password_after_boot`, default on):
+
+- After boot, `hirod` refuses to verify **or enroll** any user whose login
+  it has not seen during the current boot. The verdict is a clean
+  non-match (`reason=password_required`, camera untouched), so the PAM
+  stack simply falls through to the password prompt.
+- The first login of a boot necessarily happens through the password (or
+  another non-HIRO method such as auto-login/`nopasswdlogin`/SSH key).
+  `pam_hiro.so` reports that login from its session hook (`Op::Login`,
+  installed as `optional pam_hiro.so` in the session stack), arming face
+  auth for that user for the rest of the boot.
+- State is persisted in SQLite keyed by the kernel boot id
+  (`/proc/sys/kernel/random/boot_id`), so daemon restarts mid-boot
+  (suspend/resume, crashes) do not reset it; a real reboot prunes it.
+- Authorization applies as usual: only root or the user themselves can
+  record a login for an account.
+- Trade-off: anyone able to establish a session for a user during a boot
+  (e.g. root, or passwordless/auto-login configured by the administrator)
+  arms that user's face auth without a typed password. That matches the
+  intent — the gate exists so a stolen, freshly-booted laptop cannot be
+  unlocked by face — and passwordless login is an explicit admin choice.
 
 ### Keyring unlock (optional)
 

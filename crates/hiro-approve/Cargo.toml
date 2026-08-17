@@ -1,0 +1,16 @@
+[package]
+name = "hiro-approve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Secure-desktop approval dialog for HIRO (VT console)"
+
+[[bin]]
+name = "hiro-approve"
+path = "src/main.rs"
+
+[dependencies]
+hiro-core.workspace = true
+serde_json.workspace = true
+libc.workspace = true

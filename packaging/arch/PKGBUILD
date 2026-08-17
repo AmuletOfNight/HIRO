@@ -25,6 +25,7 @@ package() {
     install -Dm755 target/release/hirod          "$pkgdir/usr/bin/hirod"
     install -Dm755 target/release/hiro           "$pkgdir/usr/bin/hiro"
     install -Dm755 target/release/libpam_hiro.so "$pkgdir/usr/lib/security/pam_hiro.so"
+    install -Dm755 target/release/hiro-approve   "$pkgdir/usr/lib/hiro/hiro-approve"
 
     install -Dm644 etc/hiro/config.toml.example "$pkgdir/etc/hiro/config.toml.example"
     install -Dm644 crates/hiro-hw/quirks.toml   "$pkgdir/etc/hiro/quirks.toml"

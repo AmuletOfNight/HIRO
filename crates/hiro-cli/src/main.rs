@@ -128,6 +128,9 @@ fn main() {
                             report.variance
                         );
                     }
+                    if let Some(t) = r.match_threshold {
+                        println!("Calibrated per-user match threshold: {t:.3}");
+                    }
                     if r.added > 0 {
                         println!("Tip: verify with `hiro test`, then enable PAM integration.");
                     } else {
@@ -206,8 +209,9 @@ fn main() {
                         let elapsed = started.elapsed().as_millis();
                         if v.matched {
                             println!(
-                                "MATCH  score={:.3} template={:?} frames={} liveness={} ({elapsed} ms)",
+                                "MATCH  score={:.3} threshold={:.3} template={:?} frames={} liveness={} ({elapsed} ms)",
                                 v.score.unwrap_or(0.0),
+                                v.threshold_used,
                                 v.template_id,
                                 v.frames_analyzed,
                                 v.liveness_ok
@@ -215,8 +219,12 @@ fn main() {
                         } else {
                             match v.variance {
                                 Some(_) => println!(
-                                    "NO MATCH  reason={} variance={:.2} motion={:.4} ({elapsed} ms)",
-                                    v.reason, v.variance.unwrap_or(0.0), v.motion.unwrap_or(0.0)
+                                    "NO MATCH  reason={} best_score={} threshold={:.3} variance={:.2} motion={:.4} ({elapsed} ms)",
+                                    v.reason,
+                                    v.score.map(|s| format!("{s:.3}")).unwrap_or_else(|| "n/a".into()),
+                                    v.threshold_used,
+                                    v.variance.unwrap_or(0.0),
+                                    v.motion.unwrap_or(0.0)
                                 ),
                                 None => println!("NO MATCH  reason={} ({elapsed} ms)", v.reason),
                             }
@@ -332,6 +340,30 @@ fn main() {
                     s.tpm_available
                         .map(|v| if v { "yes" } else { "no" })
                         .unwrap_or("-")
+                );
+                println!(
+                    "after-reboot  : {}",
+                    if s.require_password_after_boot {
+                        "password login required before face auth"
+                    } else {
+                        "face auth not gated on reboot"
+                    }
+                );
+                println!(
+                    "auto-threshold: {}",
+                    if s.auto_threshold {
+                        "per-user calibrated"
+                    } else {
+                        "off (global match_threshold)"
+                    }
+                );
+                println!(
+                    "approval      : {}",
+                    if s.approval_enabled {
+                        "non-login requests require Allow/Disallow after match"
+                    } else {
+                        "off (face match completes instantly)"
+                    }
                 );
                 Ok(())
             }
@@ -470,6 +502,29 @@ fn doctor() {
     match manifest.verify_all(&std::path::PathBuf::from("/usr/share/hiro/models")) {
         Ok(()) => println!("all models present"),
         Err(e) => println!("model check failed: {e}\nrun scripts/fetch-models.sh"),
+    }
+
+    println!();
+    println!("== secure desktop approval ==");
+    let cfg_text = std::fs::read_to_string("/etc/hiro/config.toml").unwrap_or_default();
+    match hiro_core::config::Config::from_toml(&cfg_text) {
+        Ok(cfg) => {
+            if cfg.approval.secure_desktop {
+                let dialog = cfg.approval.secure_dialog;
+                if dialog.exists() {
+                    println!("secure desktop enabled; dialog at {}", dialog.display());
+                } else {
+                    println!(
+                        "secure desktop enabled but dialog missing: {}",
+                        dialog.display()
+                    );
+                    println!("   (redeploy.sh must install hiro-approve there; the .deb does)");
+                }
+            } else {
+                println!("secure desktop disabled (approval.secure_desktop = false)");
+            }
+        }
+        Err(e) => println!("cannot read /etc/hiro/config.toml: {e}"),
     }
 
     println!();

@@ -6,7 +6,7 @@
 
 use hiro_core::Embedding;
 
-use crate::{FaceHit, FacePipeline, FaceResult};
+use crate::{FaceDetection, FaceError, FacePipeline, FaceResult};
 
 pub struct StubPipeline;
 
@@ -58,14 +58,45 @@ impl StubPipeline {
 }
 
 impl FacePipeline for StubPipeline {
-    fn process(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceHit>> {
+    fn detect(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceDetection>> {
         let bbox = match Self::center_blob(luma, width, height) {
             Some(b) => b,
             None => return Ok(None),
         };
+        let (w, _h) = (width as usize, height as usize);
+        let (cx, cy) = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0);
+        let eye_y = cy - 0.15;
+        let mouth_y = cy + 0.2;
+        // Tiny noise-derived jitter so liveness micro-motion checks see a
+        // living subject instead of a frozen set of landmarks.
+        let jitter = (luma[0] as f32 + luma[w - 1] as f32) % 7.0 / 7.0 - 0.5;
+        let jitter = jitter * 0.008;
+        let landmarks = [
+            [cx - 0.15 + jitter, eye_y],
+            [cx + 0.15 - jitter, eye_y + jitter * 0.5],
+            [cx + jitter * 0.5, cy],
+            [cx - 0.1, mouth_y + jitter],
+            [cx + 0.1, mouth_y - jitter],
+        ];
+        Ok(Some(FaceDetection {
+            bbox,
+            landmarks,
+            det_score: 0.99,
+        }))
+    }
+
+    fn embed_crop(
+        &self,
+        luma: &[u8],
+        width: u32,
+        height: u32,
+        _landmarks: [[f32; 2]; 5],
+    ) -> FaceResult<Embedding> {
         let (w, h) = (width as usize, height as usize);
         if luma.len() != w * h {
-            return Ok(None);
+            return Err(FaceError::Pipeline(
+                "frame buffer has the wrong length".into(),
+            ));
         }
         let grid = 8;
         let gw = w / grid;
@@ -89,26 +120,7 @@ impl FacePipeline for StubPipeline {
         for _ in 0..8 {
             emb.extend_from_slice(&values);
         }
-        let (cx, cy) = ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0);
-        let eye_y = cy - 0.15;
-        let mouth_y = cy + 0.2;
-        // Tiny noise-derived jitter so liveness micro-motion checks see a
-        // living subject instead of a frozen set of landmarks.
-        let jitter = (luma[0] as f32 + luma[w - 1] as f32) % 7.0 / 7.0 - 0.5;
-        let jitter = jitter * 0.008;
-        let landmarks = [
-            [cx - 0.15 + jitter, eye_y],
-            [cx + 0.15 - jitter, eye_y + jitter * 0.5],
-            [cx + jitter * 0.5, cy],
-            [cx - 0.1, mouth_y + jitter],
-            [cx + 0.1, mouth_y - jitter],
-        ];
-        Ok(Some(FaceHit {
-            embedding: Embedding::new("stub", emb),
-            landmarks,
-            bbox,
-            det_score: 0.99,
-        }))
+        Ok(Embedding::new("stub", emb))
     }
 
     fn name(&self) -> &str {

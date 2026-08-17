@@ -12,11 +12,20 @@ test, and manage encrypted face templates.
 .TP
 .B enroll [USER] [--max N]
 Capture face templates. Stand in front of the IR camera and follow the
-quality feedback; frames that are blurry, too small, static, or duplicates
-are rejected automatically.
+quality feedback; frames that are blurry, too small, or duplicates are
+rejected automatically, and you can hold each pose for a sharp capture
+(no constant movement is required). The optional
+\fBrecognition.enroll_min_variance\fR setting re-enables rejecting static
+frames when enforced. With \fBrecognition.auto_threshold\fR (default on),
+enrollment ends with a short calibration pass that measures your genuine
+match scores and stores a per-user match threshold; the calibrated value is
+printed and shown in \fBhiro test\fR output as \fBthreshold\fR. Re-enroll to
+recalibrate (e.g. after changing camera, lighting, or appearance).
 .TP
 .B test
-Run a verification attempt against your own templates.
+Run a verification attempt against your own templates. Prints the best
+score seen and the effective threshold even on a miss, so you can see how
+close an attempt came and how the per-user threshold is moving.
 .TP
 .B list [USER]
 List enrolled templates.

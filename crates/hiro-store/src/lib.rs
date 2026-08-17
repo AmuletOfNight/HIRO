@@ -79,6 +79,7 @@ impl Store {
                 uid                INTEGER,
                 camera_fingerprint TEXT,
                 login_secret       BLOB,
+                match_threshold    REAL,
                 created_at         INTEGER NOT NULL
             );
 
@@ -98,6 +99,13 @@ impl Store {
                 user_name TEXT,
                 action    TEXT NOT NULL,
                 detail    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS boot_auth (
+                boot_id      TEXT NOT NULL,
+                user_name    TEXT NOT NULL,
+                logged_in_at INTEGER NOT NULL,
+                PRIMARY KEY (boot_id, user_name)
             );
             "#,
         )?;
@@ -121,6 +129,11 @@ impl Store {
         if !cols.iter().any(|c| c == "login_secret") {
             self.conn
                 .execute_batch("ALTER TABLE users ADD COLUMN login_secret BLOB")
+                .map_err(StoreError::Db)?;
+        }
+        if !cols.iter().any(|c| c == "match_threshold") {
+            self.conn
+                .execute_batch("ALTER TABLE users ADD COLUMN match_threshold REAL")
                 .map_err(StoreError::Db)?;
         }
         Ok(())
@@ -264,6 +277,31 @@ impl Store {
             .flatten())
     }
 
+    /// Persist the user's auto-calibrated per-user match threshold.
+    pub fn set_match_threshold(&self, user_name: &str, threshold: f32) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE users SET match_threshold = ?1 WHERE name = ?2",
+            params![threshold, user_name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::UserNotFound(user_name.into()));
+        }
+        Ok(())
+    }
+
+    /// The user's auto-calibrated per-user match threshold, if one exists.
+    pub fn match_threshold(&self, user_name: &str) -> Result<Option<f32>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT match_threshold FROM users WHERE name = ?1",
+                params![user_name],
+                |row| row.get::<_, Option<f32>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Store the sealed login password for a user (`None` removes it).
     /// The value is always the AES-256-GCM ciphertext from a `KeyManager`,
     /// never a plaintext secret.
@@ -307,6 +345,38 @@ impl Store {
             params![user_name, action, detail],
         )?;
         Ok(())
+    }
+
+    /// Record that `user_name` logged in during the boot identified by
+    /// `boot_id`, arming face authentication for them until the next boot.
+    /// Idempotent: a second login in the same boot is a no-op.
+    pub fn mark_boot_auth_user(&self, boot_id: &str, user_name: &str) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO boot_auth (boot_id, user_name, logged_in_at)
+               VALUES (?1, ?2, unixepoch())
+               ON CONFLICT(boot_id, user_name) DO NOTHING"#,
+            params![boot_id, user_name],
+        )?;
+        Ok(())
+    }
+
+    /// Login names of the users who have logged in during `boot_id`.
+    pub fn boot_auth_users(&self, boot_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_name FROM boot_auth WHERE boot_id = ?1 ORDER BY user_name")?;
+        let rows = stmt.query_map(params![boot_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Drop boot-auth records for every boot other than `boot_id`. Returns
+    /// the number of stale rows removed.
+    pub fn prune_boot_auth(&self, boot_id: &str) -> Result<usize> {
+        let changed = self.conn.execute(
+            "DELETE FROM boot_auth WHERE boot_id <> ?1",
+            params![boot_id],
+        )?;
+        Ok(changed)
     }
 }
 
@@ -382,6 +452,18 @@ mod tests {
     }
 
     #[test]
+    fn match_threshold_lifecycle() {
+        let s = store();
+        s.upsert_user("alice", None).unwrap();
+        assert!(s.match_threshold("alice").unwrap().is_none());
+        s.set_match_threshold("alice", 0.62).unwrap();
+        assert_eq!(s.match_threshold("alice").unwrap().unwrap(), 0.62);
+        // Unknown user: setter errors, getter returns None.
+        assert!(s.set_match_threshold("ghost", 0.5).is_err());
+        assert!(s.match_threshold("ghost").unwrap().is_none());
+    }
+
+    #[test]
     fn login_secret_lifecycle() {
         let s = store();
         s.upsert_user("alice", Some(1000)).unwrap();
@@ -451,6 +533,44 @@ mod tests {
         let s = store();
         s.record_event(Some("alice"), "verify", "matched").unwrap();
         s.record_event(None, "startup", "").unwrap();
+    }
+
+    #[test]
+    fn boot_auth_tracks_logins_per_boot() {
+        let s = store();
+        s.mark_boot_auth_user("boot-1", "alice").unwrap();
+        s.mark_boot_auth_user("boot-1", "bob").unwrap();
+        // Idempotent within a boot.
+        s.mark_boot_auth_user("boot-1", "alice").unwrap();
+        // A different boot is separate state.
+        s.mark_boot_auth_user("boot-2", "carol").unwrap();
+
+        let mut boot1 = s.boot_auth_users("boot-1").unwrap();
+        boot1.sort();
+        assert_eq!(boot1, vec!["alice", "bob"]);
+        assert_eq!(s.boot_auth_users("boot-2").unwrap(), vec!["carol"]);
+        assert!(s.boot_auth_users("boot-3").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_boot_auth_keeps_only_current_boot() {
+        let s = store();
+        s.mark_boot_auth_user("boot-old", "alice").unwrap();
+        s.mark_boot_auth_user("boot-old", "bob").unwrap();
+        s.mark_boot_auth_user("boot-now", "alice").unwrap();
+
+        let removed = s.prune_boot_auth("boot-now").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(s.boot_auth_users("boot-now").unwrap(), vec!["alice"]);
+        assert!(s.boot_auth_users("boot-old").unwrap().is_empty());
+    }
+
+    #[test]
+    fn boot_auth_is_isolated_from_users_table() {
+        // Recording a login does not require a users row.
+        let s = store();
+        s.mark_boot_auth_user("boot-1", "ghost").unwrap();
+        assert_eq!(s.boot_auth_users("boot-1").unwrap(), vec!["ghost"]);
     }
 
     #[test]

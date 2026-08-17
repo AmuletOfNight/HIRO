@@ -115,7 +115,9 @@ fn detect_frames() {
         let mean = gray.iter().map(|&v| f64::from(v)).sum::<f64>() / gray.len() as f64;
 
         if let Some(p) = &pipeline {
-            let dets = p.detect(&gray, frame.width, frame.height).expect("detect");
+            let dets = p
+                .detect_boxes(&gray, frame.width, frame.height)
+                .expect("detect");
             let top = dets.iter().map(|d| d.score).fold(f32::MIN, f32::max);
             let stats = p
                 .raw_score_stats(&gray, frame.width, frame.height)

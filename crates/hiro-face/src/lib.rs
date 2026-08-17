@@ -55,12 +55,56 @@ pub struct FaceHit {
     pub det_score: f32,
 }
 
+/// A face found by the detector, before embedding.
+#[derive(Debug, Clone)]
+pub struct FaceDetection {
+    /// Bounding box [x0, y0, x1, y1], normalized [0,1] in frame.
+    pub bbox: [f32; 4],
+    /// Five facial landmarks, normalized [0,1] in frame.
+    pub landmarks: [[f32; 2]; 5],
+    /// Detector confidence.
+    pub det_score: f32,
+}
+
 /// Runs detection + embedding on grayscale frames.
 pub trait FacePipeline: Send + Sync {
     /// Analyze one frame. `luma` is a `width * height` grayscale buffer.
     /// Returns the best-scoring face hit, or `Ok(None)` when no face is
     /// present.
-    fn process(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceHit>>;
+    ///
+    /// The default implementation composes [`Self::detect`] with
+    /// [`Self::embed_crop`]; implementations may override it when they need
+    /// to control the intermediate steps (e.g. treat an unalignable crop as
+    /// "no face").
+    fn process(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceHit>> {
+        let Some(det) = self.detect(luma, width, height)? else {
+            return Ok(None);
+        };
+        let embedding = self.embed_crop(luma, width, height, det.landmarks)?;
+        Ok(Some(FaceHit {
+            embedding,
+            landmarks: det.landmarks,
+            bbox: det.bbox,
+            det_score: det.det_score,
+        }))
+    }
+
+    /// Run detection only, skipping the embedding. Enrollment uses this to
+    /// apply its cheap quality gates (face size, sharpness) before paying
+    /// for the embedder.
+    fn detect(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceDetection>>;
+
+    /// Align and embed the face crop for the given normalized landmarks,
+    /// returning the embedding. Callers that already ran [`Self::detect`]
+    /// pass the detected landmarks through so the crop matches the box the
+    /// quality gates were judged against.
+    fn embed_crop(
+        &self,
+        luma: &[u8],
+        width: u32,
+        height: u32,
+        landmarks: [[f32; 2]; 5],
+    ) -> FaceResult<Embedding>;
 
     fn name(&self) -> &str;
 

@@ -11,7 +11,7 @@ use ort::value::Tensor;
 use crate::align::align_crop;
 use crate::models::Manifest;
 use crate::preprocess::{gray_to_rgb3, normalize_gray, resize_gray};
-use crate::{FaceError, FaceHit, FacePipeline, FaceResult};
+use crate::{FaceDetection, FaceError, FaceHit, FacePipeline, FaceResult};
 
 /// Anchor strides of the SCRFD detection branches.
 const STRIDES: [usize; 3] = [8, 16, 32];
@@ -206,7 +206,9 @@ pub struct DetBox {
 impl OnnxPipeline {
     /// Diagnostic: run only the detector and return all surviving
     /// candidates. Used for threshold tuning and hardware bring-up.
-    pub fn detect(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Vec<DetBox>> {
+    /// (Renamed from `detect` so the diagnostic and the
+    /// [`FacePipeline::detect`] single-box trait method do not collide.)
+    pub fn detect_boxes(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Vec<DetBox>> {
         let dets = self.run_detector(luma, width, height)?;
         Ok(dets
             .into_iter()
@@ -361,28 +363,57 @@ impl OnnxPipeline {
 
 impl FacePipeline for OnnxPipeline {
     fn process(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceHit>> {
-        let dets = self.run_detector(luma, width, height)?;
-        let Some(best) = dets.first() else {
+        let Some(det) = self.detect(luma, width, height)? else {
             return Ok(None);
         };
-
-        // Landmarks are normalized [0,1]; convert to frame pixels.
-        let mut landmarks_px = best.landmarks;
-        for lm in &mut landmarks_px {
-            lm[0] *= width as f32;
-            lm[1] *= height as f32;
-        }
-        let Some(crop) = align_crop(luma, width, height, &landmarks_px, self.emb_input_size) else {
+        let Some(crop) = align_crop(
+            luma,
+            width,
+            height,
+            &landmarks_to_pixels(det.landmarks, width, height),
+            self.emb_input_size,
+        ) else {
+            // An unalignable crop after a successful detection is treated as
+            // "no face" rather than a hard pipeline error.
             return Ok(None);
         };
         let values = self.run_embedder(&crop)?;
 
         Ok(Some(FaceHit {
             embedding: Embedding::new(&self.model_name, values),
-            landmarks: best.landmarks,
-            bbox: best.bbox,
-            det_score: best.score,
+            landmarks: det.landmarks,
+            bbox: det.bbox,
+            det_score: det.det_score,
         }))
+    }
+
+    fn detect(&self, luma: &[u8], width: u32, height: u32) -> FaceResult<Option<FaceDetection>> {
+        let dets = self.run_detector(luma, width, height)?;
+        Ok(dets.first().map(|d| FaceDetection {
+            bbox: d.bbox,
+            landmarks: d.landmarks,
+            det_score: d.score,
+        }))
+    }
+
+    fn embed_crop(
+        &self,
+        luma: &[u8],
+        width: u32,
+        height: u32,
+        landmarks: [[f32; 2]; 5],
+    ) -> FaceResult<Embedding> {
+        let Some(crop) = align_crop(
+            luma,
+            width,
+            height,
+            &landmarks_to_pixels(landmarks, width, height),
+            self.emb_input_size,
+        ) else {
+            return Err(FaceError::Pipeline("cannot align face crop".into()));
+        };
+        let values = self.run_embedder(&crop)?;
+        Ok(Embedding::new(&self.model_name, values))
     }
 
     fn name(&self) -> &str {
@@ -392,6 +423,16 @@ impl FacePipeline for OnnxPipeline {
     fn loaded(&self) -> bool {
         true
     }
+}
+
+/// Convert normalized [0,1] landmarks to frame pixel coordinates.
+fn landmarks_to_pixels(landmarks: [[f32; 2]; 5], width: u32, height: u32) -> [[f32; 2]; 5] {
+    let mut px = landmarks;
+    for lm in &mut px {
+        lm[0] *= width as f32;
+        lm[1] *= height as f32;
+    }
+    px
 }
 
 /// Classify an SCRFD-family branch output by its element count.

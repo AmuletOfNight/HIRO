@@ -20,10 +20,24 @@ Capture geometry: \fIwidth\fR, \fIheight\fR, \fIfps\fR, \fIpixel_format\fR
 .TP
 .B [recognition]
 Model directory, detector/embedder names, match threshold, quorum, timeout,
-liveness thresholds, and enrollment quality gates.
+liveness thresholds, and enrollment quality gates (face size, sharpness,
+pose dedupe, and the optional enrollment variance gate
+\fIenroll_min_variance\fR, which defaults to off so users can hold still
+while templates are captured). Automatic per-user match-threshold
+calibration (\fIauto_threshold\fR, default true): enrollment measures the
+user's genuine scores and stores a per-user threshold (bounded by
+\fIauto_threshold_min\fR/\fIauto_threshold_max\fR, a margin
+\fIauto_threshold_margin\fR below the measured low end), and every
+successful match slowly adapts it toward the observed score at the EMA rate
+\fIauto_threshold_adapt\fR (0 disables tracking; adaptation never runs on
+failures). Set \fIauto_threshold = false\fR to rely on the global
+\fImatch_threshold\fR alone.
 .TP
 .B [security]
-Rate limiting, lockout, per-user template limit, camera-pinning policy.
+Rate limiting, lockout, per-user template limit, camera-pinning policy, and
+the after-reboot password gate (\fIrequire_password_after_boot\fR, default
+true: face auth only works for users who have logged in since the last
+reboot).
 .TP
 .B [storage]
 Template database and encryption key paths.
@@ -37,6 +51,20 @@ false; when true, \fIservices\fR lists the PAM services (e.g.
 gdm-password) whose stacks receive the injected authtok. The password is
 enrolled with \fBhiro keyring set\fR and re-verified against the account
 before each release.
+.TP
+.B [approval]
+Action-approval gate (default on): non-login services pause for an
+explicit Allow/Deny decision after a confident face match.
+\fIbypass_services\fR lists the user-initiated services that skip the
+prompt (greeters, session logins, and \fBhiro test\fR by default).
+\fItimeout_ms\fR bounds the decision window; the request is denied only
+when it expires or the user clicks Deny. Stepping out of the frame is not
+a failure: after \fIabsent_frames\fR consecutive frames with no convincing
+face (score below the effective threshold minus
+\fIabsent_score_margin\fR) the buttons disappear but the request keeps
+waiting until the timeout. With \fIsecure_desktop\fR = true (default
+false) the prompt is shown on a dedicated VT by \fBhiro-approve\fR
+instead of the in-session indicator (\fIsecure_vt\fR, \fIsecure_dialog\fR).
 .SH RELOADING
 Apply changes with:
 .B hiro reload

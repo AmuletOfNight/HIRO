@@ -206,6 +206,18 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             Ok(()) => Response::ok(id, ResultValue::Prewarmed),
             Err(e) => Response::err(id, e),
         },
+        Op::Login { user, service } => match auth::record_login(daemon, caller, &user, &service) {
+            Ok(()) => Response::ok(id, ResultValue::Login),
+            Err(e) => Response::err(id, e.to_string()),
+        },
+        Op::Approve {
+            approval_id,
+            user,
+            allow,
+        } => match approve(daemon, caller, approval_id, &user, allow) {
+            Ok(()) => Response::ok(id, ResultValue::Approved),
+            Err(e) => Response::err(id, e),
+        },
         Op::Watch => Response::err(id, "watch is a streaming op"),
     }
 }
@@ -237,11 +249,59 @@ fn verdict_from_error(user: &str, e: &str) -> VerifyResult {
         motion: None,
         keyring_password: None,
         reason: reason.into(),
+        threshold_used: 0.0,
     }
 }
 
 fn uid_of(user: &str) -> Result<u32, String> {
     crate::lookup::uid_of(user).ok_or_else(|| format!("no such user: {user}"))
+}
+
+/// Record an Allow/Disallow decision for a pending action approval.
+///
+/// Only the target user (or root) may decide. The id comes from the
+/// `approval_id` field on the `approval_pending` StateEvent.
+fn approve(
+    daemon: &SharedDaemon,
+    caller: Caller,
+    approval_id: u64,
+    user: &str,
+    allow: bool,
+) -> Result<(), String> {
+    let uid = uid_of(user)?;
+    if !authorize(caller, Some(uid)) {
+        return Err(format!(
+            "caller uid {} may not decide approvals for {user}",
+            caller.uid
+        ));
+    }
+    let mut approvals = daemon
+        .approvals
+        .lock()
+        .map_err(|_| "approvals lock poisoned".to_string())?;
+    let pending = approvals
+        .get_mut(&approval_id)
+        .ok_or_else(|| format!("no pending approval {approval_id}"))?;
+    if pending.user != user {
+        return Err(format!(
+            "approval {approval_id} is for {}, not {user}",
+            pending.user
+        ));
+    }
+    pending.decided = Some(allow);
+    let service = pending.service.clone();
+    drop(approvals);
+    let store = daemon
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    audit(
+        &store,
+        Some(user),
+        "approve",
+        &format!("id={approval_id} service={service} allow={allow}"),
+    );
+    Ok(())
 }
 
 /// Check the caller may act for `user`, returning the user's uid.
@@ -267,6 +327,10 @@ fn status(daemon: &SharedDaemon) -> Result<StatusResult, String> {
         .store
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
+    let cfg = daemon
+        .cfg
+        .read()
+        .map_err(|_| "cfg lock poisoned".to_string())?;
     Ok(StatusResult {
         version: VERSION.into(),
         camera: camera.camera_path(),
@@ -278,6 +342,9 @@ fn status(daemon: &SharedDaemon) -> Result<StatusResult, String> {
         templates: store.total_templates().map_err(|e| e.to_string())?,
         tpm_available: Some(daemon.km.tpm_available()),
         uptime_secs: daemon.started_at.elapsed().as_secs(),
+        require_password_after_boot: cfg.security.require_password_after_boot,
+        auto_threshold: cfg.recognition.auto_threshold,
+        approval_enabled: cfg.approval.enabled,
     })
 }
 

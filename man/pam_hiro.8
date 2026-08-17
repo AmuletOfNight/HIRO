@@ -3,6 +3,7 @@
 pam_hiro \- PAM module for HIRO face authentication
 .SH SYNOPSIS
 auth    sufficient    pam_hiro.so [socket=PATH] [timeout_ms=N] [keyring] [debug]
+session optional    pam_hiro.so [socket=PATH]
 .SH DESCRIPTION
 \fBpam_hiro.so\fR asks the \fBhirod\fR(8) daemon for a face verdict for the
 user being authenticated.
@@ -48,11 +49,20 @@ re-verifies the password against the account before releasing it.
 .TP
 .B debug
 Verbose logging via \fBpam_syslog\fR.
+.SH SESSION HOOK
+Add \fBsession optional pam_hiro.so\fR to the service's stack (the packaged
+pam-auth-update profile does this automatically). When a login completes,
+the module's session hook reports it to \fBhirod\fR so the after-reboot
+password gate (see \fBsecurity.require_password_after_boot\fR in
+\fBhiro.conf\fR(5)) arms face auth for that user until the next reboot.
+The hook is best-effort and never blocks or fails the session.
 .SH EXAMPLES
 .nf
-# Debian/Ubuntu: enable via pam-auth-update (adds the keyring option), or
-# add to the graphical greeter's stack, e.g. /etc/pam.d/gdm-password:
+# Debian/Ubuntu: enable via pam-auth-update (adds the keyring option and
+# the session hook), or add to the graphical greeter's stack, e.g.
+# /etc/pam.d/gdm-password:
 auth    sufficient    pam_hiro.so keyring
+session optional    pam_hiro.so
 # (gdm-password already runs "auth optional pam_gnome_keyring.so" after
 #  common-auth, which is what unlocks the keyring with the injected token)
 .fi

@@ -11,6 +11,9 @@ audit trail.
 - **No images stored** — only encrypted 512-D face embeddings.
 - **Fail closed** — if the daemon or camera misbehaves, you always fall
   back to your password; authentication never blocks.
+- **Auto-calibrated thresholds** — each user gets a match threshold measured
+  from their own face at enrollment and slowly adapted on successful
+  logins; no per-machine tuning.
 
 ## Architecture
 
@@ -81,12 +84,22 @@ See `docs/security.md` for the full threat model. Highlights:
 - **IR-only**: authentication refuses non-IR cameras (`require_ir = true`).
 - **Liveness**: frame variance + landmark micro-motion reject photos and
   screen replays; IR inherently resists displays (they emit little 850 nm).
+- **Password after reboot**: like Windows Hello, face auth stays off until
+  the account has been logged into since the last reboot
+  (`security.require_password_after_boot`, default on). The first login
+  must be a password; `pam_hiro.so`'s session hook then arms face auth for
+  that user for the rest of the boot.
 - **Camera pinning**: templates bind to the enrolling camera's identity.
 - **Encrypted at rest**: AES-256-GCM; with a TPM 2.0 present the data key
   is sealed under a TPM primary key (blob in `/var/lib/hiro/hiro.key`),
   otherwise it is a root-only file. Build with `hiro-tpm/tpm` (enabled in
   packaged builds).
 - **Constant-time matching** and rate limiting + lockout per user.
+- **Action approval**: by default, non-login requests (sudo, lock screen,
+  polkit, ...) pause after a confident match for an explicit Allow/Deny
+  decision before the action runs; login screens stay instant. The prompt
+  can optionally be shown on a dedicated secure console
+  (`approval.secure_desktop`). See `docs/security.md`.
 - **Audit**: every verdict lands in the journal
   (`journalctl -t hirod -g hiro_audit`) and the events table.
 
@@ -96,7 +109,12 @@ A GNOME Shell extension (`hiro-status@hiro`, installed by the package)
 shows an animated indicator while your face is being scanned — a pulsing
 camera icon in the top bar plus a centered overlay with a dot animation,
 then a green check (with score) or red failure. It works on the desktop,
-the lock screen, and anywhere the shell runs.
+the lock screen, and anywhere the shell runs. The top-bar icon only
+appears while a scan (or its result flash) is on screen and hides when
+idle, so it does not look like the camera is in use at all times. When a
+non-login request needs approval, the overlay turns into an Allow/Deny
+prompt with a live countdown; on the secure console setup it shows a
+passive "decide on the secure console" notice instead.
 
 ```bash
 # system-wide install (via the package) + enable for your session:

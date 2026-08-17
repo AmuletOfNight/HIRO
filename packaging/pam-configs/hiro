@@ -4,3 +4,6 @@ Priority: 300
 Auth-Type: Primary
 Auth:
 	sufficient pam_hiro.so keyring
+Session-Type: Additional
+Session:
+	optional pam_hiro.so
