@@ -5,7 +5,7 @@ use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hiro_core::Config;
 use hiro_face::FacePipeline;
@@ -106,16 +106,24 @@ pub struct Watcher {
 /// (blocking every other user's face auth) by chaining long verify/enroll
 /// requests.
 ///
-/// Acquired via [`Daemon::camera_acquire`]; dropping the guard releases the
-/// camera *and* records the hold duration against the caller's rolling
-/// budget. `user` is `None` for the approval phase, which follows a real
-/// face match and is exempt from the quota (denying a matched request
-/// because a quota was already spent would be hostile to legitimate users).
+/// Acquired via [`Daemon::camera_acquire`]; the user's rolling budget is
+/// *reserved* up front (returned as the [`Self::budget_cap`] hold cap) and
+/// *settled* to the actual hold on drop, so queued concurrent requests of
+/// the same user are throttled at acquisition time. `user` is `None` for
+/// the approval phase, which follows a real face match and is exempt from
+/// the quota (denying a matched request because a quota was already spent
+/// would be hostile to legitimate users).
 pub struct CameraGuard<'a> {
     camera: std::sync::MutexGuard<'a, CameraSession>,
     daemon: &'a Daemon,
     user: Option<String>,
     started: Instant,
+    /// Hard cap on this hold, from the camera-budget reservation. `None`
+    /// when the budget is disabled (or for budget-exempt approval phases).
+    /// Capture loops must not keep the camera past this.
+    cap: Option<Duration>,
+    /// Reservation token to settle against on drop.
+    token: Option<u64>,
 }
 
 impl Deref for CameraGuard<'_> {
@@ -136,9 +144,22 @@ impl Drop for CameraGuard<'_> {
         self.camera.release();
         if let Some(user) = &self.user {
             if let Ok(mut policy) = self.daemon.policy.lock() {
-                policy.record_camera_time(user, self.started.elapsed());
+                match self.token {
+                    Some(token) => policy.camera_budget_settle(user, token, self.started.elapsed()),
+                    None => policy.record_camera_time(user, self.started.elapsed()),
+                }
             }
         }
+    }
+}
+
+impl CameraGuard<'_> {
+    /// The maximum hold allowed by this guard's camera-budget reservation,
+    /// if the budget is enabled. Capture loops intersect their own deadline
+    /// with this so a request can never hold the shared camera past the
+    /// user's allowance.
+    pub fn budget_cap(&self) -> Option<Duration> {
+        self.cap
     }
 }
 
@@ -231,7 +252,9 @@ pub struct DaemonOptions {
 
 impl Daemon {
     pub fn build(cfg: Config, opts: DaemonOptions) -> Result<SharedDaemon, String> {
-        let quirks = QuirkDb::load(None);
+        // Admin-provided quirks override / extend the built-in IR-emitter
+        // table (documented path: /etc/hiro/quirks.toml).
+        let quirks = QuirkDb::load(Some(std::path::Path::new("/etc/hiro/quirks.toml")));
         let store = match opts.store {
             Some(s) => s,
             None => Store::open(&cfg.storage.db_path).map_err(|e| e.to_string())?,
@@ -287,32 +310,52 @@ impl Daemon {
     /// rolling camera-time budget so a single account cannot hold the
     /// camera indefinitely and starve every other user's face auth.
     ///
-    /// The returned [`CameraGuard`] releases the camera and records the
-    /// hold duration on drop (including panic paths). Pass `user = None`
-    /// to skip the budget (used by the action-approval phase, which runs
-    /// only after a real face match for an authorized request).
-    pub fn camera_acquire(&self, user: Option<&str>) -> AuthResult<CameraGuard<'_>> {
-        if let Some(u) = user {
+    /// The budget is reserved up front: `intended` is the caller's intended
+    /// hold (its request deadline), and the returned guard's
+    /// [`CameraGuard::budget_cap`] is `min(remaining budget, intended)` —
+    /// capture loops must not exceed it. On drop the reservation is settled
+    /// to the actual hold. Pass `user = None` to skip the budget (used by
+    /// the action-approval phase, which runs only after a real face match
+    /// for an authorized request).
+    pub fn camera_acquire(
+        &self,
+        user: Option<&str>,
+        intended: Duration,
+    ) -> AuthResult<CameraGuard<'_>> {
+        let (cap, token) = if let Some(u) = user {
             let mut policy = self
                 .policy
                 .lock()
                 .map_err(|_| AuthError::Internal("policy lock poisoned".into()))?;
-            if !policy.camera_budget_check(u) {
+            let (cap, token) = policy.camera_budget_reserve(u, intended);
+            if cap == Some(Duration::ZERO) {
                 return Err(AuthError::RateLimited);
             }
-        }
+            (cap, token)
+        } else {
+            (None, None)
+        };
         let mut camera = self
             .camera
             .lock()
             .map_err(|_| AuthError::Internal("camera lock poisoned".into()))?;
-        camera
-            .acquire()
-            .map_err(|e| AuthError::Camera(e.to_string()))?;
+        if let Err(e) = camera.acquire() {
+            // Return the reservation on the failure path so a refused
+            // acquire does not consume the user's budget.
+            if let (Some(u), Some(tok)) = (user, token) {
+                if let Ok(mut policy) = self.policy.lock() {
+                    policy.camera_budget_settle(u, tok, Duration::ZERO);
+                }
+            }
+            return Err(AuthError::Camera(e.to_string()));
+        }
         Ok(CameraGuard {
             camera,
             daemon: self,
             user: user.map(str::to_string),
             started: Instant::now(),
+            cap,
+            token,
         })
     }
 

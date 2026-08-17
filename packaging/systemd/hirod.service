@@ -10,8 +10,20 @@ ExecStart=/usr/sbin/hirod
 Restart=on-failure
 RestartSec=5s
 
-# Daemon needs root (camera + template encryption key) but is otherwise
-# locked down hard.
+# The daemon must run as uid 0 to read shadow, the template key, the camera
+# nodes, and the TPM as their owner, and to act for any user in SO_PEERCRED
+# authorization (root callers may authenticate for anyone — that is how
+# sudo/su/polkit/greeter flows work). None of that needs a capability, so
+# the bounding set is emptied: a compromise of the daemon (ONNX, SQLite,
+# V4L2) no longer carries CAP_SYS_ADMIN/CAP_DAC_OVERRIDE/CAP_SYS_PTRACE/...
+# into the rest of the system.
+#
+# Note: the secure-desktop dialog (hiro-approve) is spawned via systemd-run,
+# which starts a fresh transient unit with the manager's default capability
+# set, so VT switching (CAP_SYS_TTY_CONFIG) keeps working. If the direct
+# spawn fallback must retain VT switching on a system without systemd,
+# replace the empty line below with:  CapabilityBoundingSet=CAP_SYS_TTY_CONFIG
+CapabilityBoundingSet=
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -28,9 +40,26 @@ RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+# Deny privileged/obsolete/debugging syscalls a face-auth daemon never
+# needs. NOTE: the chown family is explicitly whitelisted - SQLite calls
+# fchown() on the -wal/-shm side files to match the database file's owner,
+# and @privileged (via @chown) would otherwise SIGSYS-kill the daemon the
+# moment the store opens. (With the empty CapabilityBoundingSet above, a
+# no-op ownership change is all these can ever do anyway.)
+SystemCallFilter=~@privileged @obsolete @debug
+SystemCallFilter=chown chown32 fchown fchown32 fchownat lchown lchown32
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+# Files the daemon creates (key file, database, per-approval secrets) are
+# already given explicit 0600/0700 modes; a restrictive umask makes that
+# unconditional even if a future code path forgets.
+UMask=0077
+# With the empty bounding set the daemon cannot ptrace anyway; also hide
+# other processes' /proc entries so a compromised daemon cannot harvest
+# them for follow-up attacks. (Not ProcSubset=pid: the after-reboot gate
+# reads /proc/sys/kernel/random/boot_id and that must keep working.)
+ProtectProc=noaccess
 
 [Install]
 WantedBy=multi-user.target

@@ -1185,3 +1185,142 @@ fn secure_approval_requires_root_and_secret() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     env.server_thread.join().unwrap();
 }
+
+/// F1 regression: a single local uid must not be able to pin every server
+/// connection slot. Pre-fix, one account could hold 32 idle connections
+/// (watch streams or slowloris) and permanently disable face authentication
+/// for everyone ("server busy" for every new PAM client). The per-uid cap
+/// must reject excess connections from the same uid while the global pool
+/// stays available.
+#[test]
+fn connection_slots_are_capped_per_uid() {
+    let (daemon, _dir) = build_daemon();
+    let socket = daemon.cfg.read().unwrap().daemon.socket_path.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_thread = {
+        let daemon = daemon.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || hirod::server::serve(daemon, shutdown).unwrap())
+    };
+
+    let connect = || {
+        let mut s = None;
+        for _ in 0..100 {
+            if let Ok(x) = UnixStream::connect(&socket) {
+                s = Some(x);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        s.expect("socket connect")
+    };
+    let expect_busy = |s: UnixStream| {
+        let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut line = String::new();
+        BufReader::new(s.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(
+            line.contains("server busy"),
+            "excess same-uid connection should be refused, got: {line}"
+        );
+    };
+
+    // Fill the per-uid cap with idle connections (each pins a handler
+    // thread until closed, exactly like the old slowloris/watch attack).
+    let mut held: Vec<UnixStream> = Vec::new();
+    for _ in 0..hirod::server::MAX_CONNECTIONS_PER_UID {
+        held.push(connect());
+    }
+
+    // An excess connection from the same uid is rejected with "server busy".
+    expect_busy(connect());
+
+    // Dropping the held connections frees the slots: the same uid can now
+    // fill the cap again, and the (cap+1)-th connection is refused once
+    // more — proving the per-uid accounting released them.
+    drop(held);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut refill: Vec<UnixStream> = Vec::new();
+    for _ in 0..hirod::server::MAX_CONNECTIONS_PER_UID {
+        refill.push(connect());
+    }
+    expect_busy(connect());
+    drop(refill);
+
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server_thread.join().unwrap();
+}
+
+/// F1 regression: watch subscriptions are capped per uid so a single account
+/// cannot occupy the whole server with long-lived state streams.
+#[test]
+fn watch_streams_are_capped_per_uid() {
+    let (daemon, _dir) = build_daemon();
+    let socket = daemon.cfg.read().unwrap().daemon.socket_path.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_thread = {
+        let daemon = daemon.clone();
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || hirod::server::serve(daemon, shutdown).unwrap())
+    };
+
+    // Open one watch subscription and consume the initial idle replay, which
+    // also proves the subscription was registered.
+    let open_watch = || {
+        let mut stream = None;
+        for _ in 0..100 {
+            if let Ok(s) = UnixStream::connect(&socket) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let mut stream = stream.expect("socket");
+        let req = Request {
+            v: PROTOCOL_VERSION,
+            id: 0,
+            op: Op::Watch,
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert!(first.contains("\"idle\""), "expected idle replay: {first}");
+        stream
+    };
+
+    // Fill the per-uid watch cap. Each watcher holds a connection slot.
+    let mut watchers: Vec<UnixStream> = Vec::new();
+    for _ in 0..hirod::server::MAX_WATCHERS_PER_UID {
+        watchers.push(open_watch());
+    }
+
+    // The next watch from the same uid must be refused with an error, not
+    // silently registered.
+    let mut extra = UnixStream::connect(&socket).unwrap();
+    let req = Request {
+        v: PROTOCOL_VERSION,
+        id: 0,
+        op: Op::Watch,
+    };
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    extra.write_all(line.as_bytes()).unwrap();
+    let _ = extra.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut resp_line = String::new();
+    BufReader::new(extra.try_clone().unwrap())
+        .read_line(&mut resp_line)
+        .unwrap();
+    assert!(
+        resp_line.contains("too many watch subscribers"),
+        "excess watch should be refused, got: {resp_line}"
+    );
+
+    drop(watchers);
+    drop(extra);
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    server_thread.join().unwrap();
+}

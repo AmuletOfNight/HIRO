@@ -28,11 +28,18 @@ D="$TMP/hiro_${VERSION}_amd64"
 
 install -Dm755 target/release/hirod            "$D/usr/sbin/hirod"
 install -Dm755 target/release/hiro             "$D/usr/bin/hiro"
+install -Dm755 target/release/hiro-ui          "$D/usr/bin/hiro-ui"
 install -Dm755 target/release/libpam_hiro.so   "$D/lib/$MULTIARCH/security/pam_hiro.so"
+# Secure-desktop approval dialog — the daemon spawns this via systemd-run
+# when approval.secure_desktop = true. Default approval.secure_dialog
+# points here, so keep the path in sync with crates/hiro-core config.rs.
+install -Dm755 target/release/hiro-approve     "$D/usr/lib/hiro/hiro-approve"
 install -Dm644 etc/hiro/config.toml.example    "$D/etc/hiro/config.toml.example"
 install -Dm644 crates/hiro-hw/quirks.toml      "$D/etc/hiro/quirks.toml"
 install -Dm644 packaging/systemd/hirod.service         "$D/lib/systemd/system/hirod.service"
 install -Dm644 packaging/systemd/hirod-resume.service  "$D/lib/systemd/system/hirod-resume.service"
+install -Dm644 packaging/systemd-user/hiro-ui.service  "$D/usr/lib/systemd/user/hiro-ui.service"
+install -Dm644 packaging/xdg-autostart/hiro-ui.desktop "$D/etc/xdg/autostart/hiro-ui.desktop"
 install -Dm644 packaging/udev/99-hiro.rules            "$D/usr/lib/udev/rules.d/99-hiro.rules"
 install -Dm644 packaging/pam-configs/hiro              "$D/usr/share/pam-configs/hiro"
 install -Dm644 packaging/polkit/hiro.conf              "$D/usr/share/hiro/polkit-agent-helper-hiro.conf"
@@ -42,6 +49,7 @@ install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css  
 install -Dm755 scripts/fetch-models.sh                 "$D/usr/share/hiro/fetch-models.sh"
 install -Dm644 crates/hiro-face/models/manifest.toml   "$D/usr/share/hiro/models/manifest.toml"
 install -Dm644 man/hiro.1       "$D/usr/share/man/man1/hiro.1"
+install -Dm644 man/hiro-ui.1    "$D/usr/share/man/man1/hiro-ui.1"
 install -Dm644 man/hirod.8      "$D/usr/share/man/man8/hirod.8"
 install -Dm644 man/pam_hiro.8   "$D/usr/share/man/man8/pam_hiro.8"
 install -Dm644 man/hiro.conf.5  "$D/usr/share/man/man5/hiro.conf.5"
@@ -59,13 +67,14 @@ Priority: optional
 Architecture: amd64
 Maintainer: HIRO Developers <hiro@example.org>
 Installed-Size: $(du -sk "$D" | cut -f1)
-Depends: libpam-runtime
+Depends: libpam-runtime, libgtk-3-0
 Recommends: linux-enable-ir-emitter, v4l-utils
 Description: Windows Hello-style face authentication for Linux
  HIRO uses your laptop's built-in Windows Hello IR camera to authenticate
  through PAM: login, lock screen, sudo, and polkit prompts. Face templates
  are stored as encrypted embeddings, never images, and the IR emitter is
  driven automatically. Everything runs locally - no network, no cloud.
+ hiro-ui provides a desktop-agnostic scan indicator and approval prompt.
 EOF
 
 cp packaging/debian/postinst "$D/DEBIAN/postinst"

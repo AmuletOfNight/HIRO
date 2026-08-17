@@ -152,3 +152,16 @@ secure_desktop = false
 secure_vt = 8
 # Path to the secure-desktop dialog helper.
 secure_dialog = "/usr/lib/hiro/hiro-approve"
+
+[ui]
+# Desktop-agnostic session UI (`hiro-ui`): the GNOME Shell extension is the
+# first-class indicator, and hiro-ui covers every other desktop (and GNOME
+# sessions without the extension enabled).
+#
+# active = "auto" (default): render unless running on GNOME with the
+# hiro-status@hiro Shell extension enabled — the extension owns the UI
+# there, so hiro-ui defers (exits).
+# active = "on": always render, ignoring desktop/extension detection.
+# active = "off": never render (rely on the extension, the secure console,
+# or no UI at all).
+active = "auto"

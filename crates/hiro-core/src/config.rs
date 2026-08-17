@@ -316,6 +316,40 @@ impl Default for DaemonConfig {
     }
 }
 
+/// How the desktop-agnostic fallback UI (`hiro-ui`) decides whether to
+/// render the in-session indicator / approval prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiMode {
+    /// Render unless running on GNOME with the `hiro-status@hiro` Shell
+    /// extension enabled (which owns the UI there).
+    #[default]
+    Auto,
+    /// Always render, ignoring desktop/extension detection.
+    On,
+    /// Never render (rely on the GNOME extension, the secure console, or
+    /// no UI at all).
+    Off,
+}
+
+/// Session UI configuration for the desktop-agnostic `hiro-ui` fallback.
+///
+/// The GNOME Shell extension remains the first-class UI; `hiro-ui` covers
+/// every other desktop (and GNOME sessions without the extension enabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub active: UiMode,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            active: UiMode::Auto,
+        }
+    }
+}
+
 /// Automatic login-keyring unlock on face authentication.
 ///
 /// When enabled, the login password the user enrolled with `hiro keyring
@@ -364,6 +398,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub keyring: KeyringConfig,
     pub approval: ApprovalConfig,
+    pub ui: UiConfig,
 }
 
 impl Config {
@@ -694,5 +729,27 @@ mod tests {
     fn approval_rejects_zero_timeout() {
         let err = Config::from_toml("[approval]\ntimeout_ms = 0").unwrap_err();
         assert!(err.message.contains("approval.timeout_ms"), "{err}");
+    }
+
+    #[test]
+    fn ui_defaults_to_auto() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ui.active, UiMode::Auto);
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.ui.active, UiMode::Auto);
+    }
+
+    #[test]
+    fn ui_mode_roundtrip() {
+        let cfg = Config::from_toml("[ui]\nactive = \"off\"").unwrap();
+        assert_eq!(cfg.ui.active, UiMode::Off);
+        let cfg = Config::from_toml("[ui]\nactive = \"on\"").unwrap();
+        assert_eq!(cfg.ui.active, UiMode::On);
+    }
+
+    #[test]
+    fn ui_rejects_unknown_mode() {
+        let err = Config::from_toml("[ui]\nactive = \"sometimes\"").unwrap_err();
+        assert!(err.message.contains("active"), "{err}");
     }
 }

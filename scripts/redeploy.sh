@@ -216,9 +216,13 @@ mkdir -p /var/lib/hiro
 chmod 700 /var/lib/hiro
 
 # --- PAM profile (Debian/Ubuntu) -------------------------------------------
+# The profile is installed at /usr/share/pam-configs/hiro with Default: no:
+# face authentication stays off until the admin explicitly enables it
+# (matching the .deb behaviour). Do NOT run `pam-auth-update --package`
+# here — it would auto-apply the profile to every common-auth service.
 if command -v pam-auth-update >/dev/null 2>&1; then
-    echo "== refreshing pam-auth-update profile =="
-    DEBIAN_FRONTEND=noninteractive pam-auth-update --package
+    echo "== PAM profile installed (opt-in) =="
+    echo "   Enable with:  sudo pam-auth-update   (tick \"HIRO face authentication\")"
 fi
 
 # --- services ---------------------------------------------------------------

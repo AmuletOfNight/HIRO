@@ -1,0 +1,18 @@
+[package]
+name = "hiro-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop-agnostic status indicator and approval prompt for HIRO"
+
+[dependencies]
+hiro-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true
+libc.workspace = true
+gtk.workspace = true
+glib = "0.18"

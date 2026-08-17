@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HIRO Face Auth Status
+Comment=Desktop-agnostic HIRO scan indicator and approval prompt
+Exec=/usr/bin/hiro-ui
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

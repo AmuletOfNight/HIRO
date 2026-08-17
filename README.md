@@ -43,7 +43,7 @@ audit trail.
 Crates: `hiro-core` (config/IPC/embeddings), `hiro-hw` (V4L2 + emitter),
 `hiro-face` (ONNX pipeline + stub), `hiro-store` (SQLite),
 `hiro-tpm` (key management), `hirod` (daemon), `pam-hiro` (PAM module),
-`hiro-cli` (CLI).
+`hiro-cli` (CLI), `hiro-ui` (desktop-agnostic session UI).
 
 ## Quick start (Ubuntu/Debian)
 
@@ -138,6 +138,33 @@ The indicator consumes the daemon's `watch` stream (newline-delimited
 `StateEvent` JSON on the existing socket), so any client can drive UI
 with it — the extension is just one consumer.
 
+### Desktop-agnostic fallback (`hiro-ui`)
+
+The extension only runs on GNOME Shell. On every other desktop — and on
+GNOME sessions without the extension — a small GTK3 card (`hiro-ui`) shows
+the same scanning indicator, Allow/Deny approval prompts, and result
+flashes. It is installed and enabled by the package:
+
+- **systemd user service** (`hiro-ui.service`) or **XDG autostart** entry;
+  a single-instance guard makes running both harmless.
+- It auto-defers to the GNOME Shell extension when that is the active UI;
+  control it with the `[ui]` section of `/etc/hiro/config.toml`
+  (`active = "auto" | "on" | "off"`, default `auto`). See `man hiro-ui`,
+  `man hiro.conf`.
+- Disable it entirely (e.g. you only want the secure-console approval
+  dialog) with `[ui] active = "off"`.
+
+```bash
+# check which UI is active
+hiro status
+# or, in detail
+hiro doctor
+```
+
+Note: an in-session overlay cannot appear above a locked screen or the
+login greeter, so lock-screen unlocks on non-GNOME desktops fall back to
+your password (fail-closed).
+
 ## Hardware support
 
 USB **UVC IR cameras** (the classic Windows Hello module) exposed as V4L2
@@ -164,7 +191,9 @@ cargo clippy --workspace --all-targets
 ```
 
 The test suite exercises the full auth path against a deterministic mock
-camera and stub pipeline — no hardware needed.
+camera and stub pipeline — no hardware needed. `hiro-ui` additionally
+requires GTK3 development headers to build (`libgtk-3-dev` on
+Debian/Ubuntu; it links against system `libgtk-3`).
 
 ## License
 

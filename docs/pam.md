@@ -5,14 +5,17 @@ the password; anything else falls through to it.
 
 ## Debian / Ubuntu (pam-auth-update)
 
-The package ships a `pam-auth-update` profile. Enable it:
+The package ships a `pam-auth-update` profile — **disabled by default**.
+Installing the package must not silently change your authentication stack,
+so face auth is opt-in:
 
 ```bash
 sudo pam-auth-update      # tick "HIRO face authentication"
 ```
 
-This adds `auth sufficient pam_hiro.so keyring` to `common-auth`, covering
-`sudo`, `su`, login, and the greeter in one shot.
+This adds `auth sufficient pam_hiro.so` to `common-auth`, covering
+`sudo`, `su`, login, and the greeter in one shot. (The profile deliberately
+does **not** carry the `keyring` argument — see the keyring section below.)
 
 ## Keyring unlock (GNOME Keyring / KWallet)
 
@@ -30,9 +33,16 @@ sudo systemctl restart hirod
 # 2. Store your login password once (re-run after changing it):
 hiro keyring set
 
-# 3. Make sure pam_hiro carries the `keyring` argument (the packaged
-#    pam-auth-update profile already does):
-sudo pam-auth-update
+# 3. Make sure pam_hiro carries the `keyring` argument on the greeter
+#    service. The packaged pam-auth-update profile intentionally omits it
+#    (so enabling face auth never pulls in keyring unlock), and the
+#    generated common-auth ordering puts pam_unix before pam_hiro, which
+#    breaks the "inject authtok, fall through to pam_unix" flow. Add the
+#    argument to the greeter service directly, BEFORE pam_unix, e.g.:
+#      # /etc/pam.d/gdm-password
+#      auth    sufficient    pam_hiro.so keyring
+#      @include common-auth
+#    (adapt for sddm / lightdm / login).
 ```
 
 How it works: `pam_hiro.so` asks `hirod` for the sealed login password on a
@@ -138,7 +148,7 @@ pamtester login "$USER" authenticate   # with HIRO enabled, it verifies your fac
 | Symptom | Check |
 | --- | --- |
 | Password prompt appears instantly | `journalctl -t hirod -g hiro_audit` — look for `reason=no_templates`, `camera_unavailable`, or `denied` |
-| Face seen but verdict is `liveness_failed` | You were recognized but didn't move enough during the capture window. Keep gentle head movement through the whole scan (the gate needs both frame variance and landmark motion). The GNOME Shell extension shows live progress bars and a "move your head slightly" hint. |
+| Face seen but verdict is `liveness_failed` | You were recognized but didn't move enough during the capture window. Keep gentle head movement through the whole scan (the gate needs both frame variance and landmark motion). The GNOME Shell extension — or `hiro-ui` on other desktops — shows live progress bars and a "move your head slightly" hint. |
 | `sudo` hangs briefly | The module waits for the daemon (default 5 s). If the daemon is down, fix `hirod.service` — authentication still falls back to password |
 | Nothing in the journal | Enable `debug` in the PAM line: `pam_hiro.so debug` |
 
