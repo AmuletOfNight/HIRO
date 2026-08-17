@@ -213,6 +213,18 @@ pub struct EnrollResult {
     /// captured).
     #[serde(default)]
     pub match_threshold: Option<f32>,
+    /// Distinct templates the user now has in total (existing + `added`).
+    #[serde(default)]
+    pub total_templates: usize,
+    /// Whether the user now meets the enrollment minimum
+    /// `recognition.enroll_min_templates` (always `true` when the minimum
+    /// is 0). When `false`, the templates captured so far are kept and the
+    /// user should run enrollment again to add more poses.
+    #[serde(default)]
+    pub min_templates_met: bool,
+    /// The configured minimum (`0` when disabled).
+    #[serde(default)]
+    pub min_templates_required: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +269,10 @@ pub struct StatusResult {
 pub struct TemplateInfo {
     pub id: i64,
     pub created_at: i64,
+    /// Last time template refinement blended a granted match into this
+    /// template (`None` when it has never been refined).
+    #[serde(default)]
+    pub refined_at: Option<i64>,
     pub quality: Option<f32>,
     pub device: Option<String>,
 }

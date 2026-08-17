@@ -93,6 +93,15 @@ struct LoadedTemplate {
     embedding: Embedding,
 }
 
+/// What `verify_inner` learned, alongside the wire result: the best-scoring
+/// live embedding and the template it matched best. Kept out of
+/// [`VerifyResult`] (which crosses the IPC boundary) and used only
+/// daemon-side for adaptive template refinement after a granted match.
+struct VerifyOutcome {
+    result: VerifyResult,
+    best_sample: Option<(i64, Embedding)>,
+}
+
 fn load_templates(daemon: &SharedDaemon, user: &str) -> AuthResult<Vec<LoadedTemplate>> {
     let store = daemon
         .store
@@ -257,6 +266,89 @@ fn adapt_threshold(daemon: &SharedDaemon, user: &str, observed: f32) -> AuthResu
         store.set_match_threshold(user, next).map_err(|e| {
             AuthError::Internal(format!("cannot persist calibrated threshold: {e}"))
         })?;
+    }
+    Ok(())
+}
+
+/// Blend a confident live embedding into the stored template it matched, so
+/// the template slowly follows the user's appearance (haircut, glasses,
+/// aging) without a re-enrollment.
+///
+/// Safety mirrors [`adapt_threshold`]:
+///
+/// * only ever called after a **granted** match (post-approval) — never on
+///   a failure, so an attacker cannot poison the template without already
+///   passing the match threshold, quorum, and liveness gate;
+/// * only high-confidence samples refine: the observed score must sit at
+///   least `template_refine_min_margin` above the threshold actually used,
+///   so marginal matches cannot drag the template toward an impostor;
+/// * the EMA rate `template_refine_rate` is small, so drift is slow, and
+///   writes are bounded by the same rate limiting and camera budget as any
+///   other authentication.
+///
+/// The refined template is re-sealed under the user-bound AEAD (same as
+/// enrollment) and the write is audited.
+fn refine_template(
+    daemon: &SharedDaemon,
+    user: &str,
+    template_id: i64,
+    live: &Embedding,
+    score: Option<f32>,
+    threshold: f32,
+) -> AuthResult<()> {
+    let cfg = daemon
+        .cfg
+        .read()
+        .map_err(|_| AuthError::Internal("cfg lock poisoned".into()))?
+        .clone();
+    if !cfg.recognition.template_refine_enabled {
+        return Ok(());
+    }
+    let rate = cfg.recognition.template_refine_rate;
+    if rate <= 0.0 {
+        return Ok(());
+    }
+    let Some(score) = score else {
+        return Ok(());
+    };
+    if score < threshold + cfg.recognition.template_refine_min_margin {
+        return Ok(());
+    }
+
+    let templates = load_templates(daemon, user)?;
+    let Some(target) = templates.iter().find(|t| t.id == template_id) else {
+        // Removed mid-request (or a stale id): nothing to refine.
+        return Ok(());
+    };
+    // Never blend across models or dimensions (a pipeline swap or an
+    // inconsistent row); the template set is versioned by model.
+    if target.embedding.model != live.model || target.embedding.dim != live.dim {
+        log::warn!("template refinement skipped for {user}: model/dim mismatch");
+        return Ok(());
+    }
+    let Some(blended) = target.embedding.blend_toward(live, rate) else {
+        return Ok(());
+    };
+
+    let ciphertext = daemon
+        .km
+        .seal(user.as_bytes(), &blended.serialize())
+        .map_err(|e| AuthError::Internal(format!("template sealing failed: {e}")))?;
+    let store = daemon
+        .store
+        .lock()
+        .map_err(|_| AuthError::Internal("store lock poisoned".into()))?;
+    if store
+        .update_template(user, template_id, &ciphertext)
+        .map_err(|e| AuthError::Internal(format!("template update failed: {e}")))?
+    {
+        audit(
+            &store,
+            Some(user),
+            "template_refine",
+            &format!("template={template_id} score={score:.3} rate={rate}"),
+        );
+        log::info!("refined template {template_id} for {user} (score {score:.3})");
     }
     Ok(())
 }
@@ -475,7 +567,8 @@ pub fn verify(
     // would lie to the status indicator when no camera is available (or the
     // user has no templates), which fails without ever scanning.
     match verify_inner(daemon, caller, user, service, timeout_ms) {
-        Ok(mut result) => {
+        Ok(outcome) => {
+            let mut result = outcome.result;
             // Action-approval gate: for non-login services (sudo, lock,
             // polkit, ...), a confident face match pauses for an explicit
             // Allow/Disallow decision before the action is granted. Login
@@ -537,10 +630,27 @@ pub fn verify(
                     policy.record_failure(user);
                 }
             }
-            // Slow adaptive tightening: nudge the per-user threshold toward
-            // this match's observed score. Success-only, so failed probes can
-            // never weaken it.
+            // Post-grant adaptation, both success-only so failed probes can
+            // never weaken the enrollment:
             if result.matched {
+                // Template refinement: blend the best-scoring live frame
+                // into the template it matched, so the template slowly
+                // follows the user's appearance. Runs only after access was
+                // granted (the approval gate above already resolved).
+                if let Some((template_id, embedding)) = &outcome.best_sample {
+                    if let Err(e) = refine_template(
+                        daemon,
+                        user,
+                        *template_id,
+                        embedding,
+                        result.score,
+                        result.threshold_used,
+                    ) {
+                        log::warn!("template refinement skipped: {e}");
+                    }
+                }
+                // Slow adaptive tightening: nudge the per-user threshold
+                // toward this match's observed score.
                 if let Some(score) = result.score {
                     if let Err(e) = adapt_threshold(daemon, user, score) {
                         log::warn!("threshold adaptation skipped: {e}");
@@ -642,7 +752,7 @@ fn verify_inner(
     user: &str,
     _service: &str,
     timeout_ms: u64,
-) -> AuthResult<VerifyResult> {
+) -> AuthResult<VerifyOutcome> {
     let uid = target_uid(user)?;
     if !authorize(caller, Some(uid)) {
         return Err(AuthError::Denied(format!(
@@ -667,20 +777,23 @@ fn verify_inner(
 
     let templates = load_templates(daemon, user)?;
     if templates.is_empty() {
-        return Ok(VerifyResult {
-            matched: false,
-            user: user.into(),
-            score: None,
-            template_id: None,
-            frames_analyzed: 0,
-            liveness_ok: false,
-            camera_ok: true,
-            elapsed_ms: 0,
-            variance: None,
-            motion: None,
-            keyring_password: None,
-            reason: "no_templates".into(),
-            threshold_used: threshold,
+        return Ok(VerifyOutcome {
+            result: VerifyResult {
+                matched: false,
+                user: user.into(),
+                score: None,
+                template_id: None,
+                frames_analyzed: 0,
+                liveness_ok: false,
+                camera_ok: true,
+                elapsed_ms: 0,
+                variance: None,
+                motion: None,
+                keyring_password: None,
+                reason: "no_templates".into(),
+                threshold_used: threshold,
+            },
+            best_sample: None,
         });
     }
 
@@ -713,7 +826,30 @@ fn verify_inner(
             (Some(binding), Some(secret)) if !binding.is_empty() && !secret.is_empty() => binding,
             _ => {
                 camera.release();
-                return Ok(VerifyResult {
+                return Ok(VerifyOutcome {
+                    result: VerifyResult {
+                        matched: false,
+                        user: user.into(),
+                        score: None,
+                        template_id: None,
+                        frames_analyzed: 0,
+                        liveness_ok: false,
+                        camera_ok: false,
+                        elapsed_ms: 0,
+                        variance: None,
+                        motion: None,
+                        keyring_password: None,
+                        reason: "camera_mismatch".into(),
+                        threshold_used: threshold,
+                    },
+                    best_sample: None,
+                });
+            }
+        };
+        if pinned != current {
+            camera.release();
+            return Ok(VerifyOutcome {
+                result: VerifyResult {
                     matched: false,
                     user: user.into(),
                     score: None,
@@ -727,25 +863,8 @@ fn verify_inner(
                     keyring_password: None,
                     reason: "camera_mismatch".into(),
                     threshold_used: threshold,
-                });
-            }
-        };
-        if pinned != current {
-            camera.release();
-            return Ok(VerifyResult {
-                matched: false,
-                user: user.into(),
-                score: None,
-                template_id: None,
-                frames_analyzed: 0,
-                liveness_ok: false,
-                camera_ok: false,
-                elapsed_ms: 0,
-                variance: None,
-                motion: None,
-                keyring_password: None,
-                reason: "camera_mismatch".into(),
-                threshold_used: threshold,
+                },
+                best_sample: None,
             });
         }
     }
@@ -765,6 +884,7 @@ fn verify_inner(
     let mut hits: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     let mut best_score: Option<f32> = None;
     let mut best_template: Option<i64> = None;
+    let mut best_embedding: Option<Embedding> = None;
     let mut frames_analyzed = 0u32;
     let mut saw_face = false;
     let mut liveness_satisfied = false;
@@ -841,6 +961,7 @@ fn verify_inner(
                 if sim > best_score.unwrap_or(-2.0) {
                     best_score = Some(sim);
                     best_template = Some(tpl.id);
+                    best_embedding = Some(hit.embedding.clone());
                 }
                 if constant_time_match(sim, threshold) {
                     let count = hits.entry(tpl.id).or_insert(0);
@@ -853,20 +974,23 @@ fn verify_inner(
                             // The face matched and (when enabled) the
                             // liveness gate is satisfied: accept now.
                             camera.release();
-                            return Ok(VerifyResult {
-                                matched: true,
-                                user: user.into(),
-                                score: best_score,
-                                template_id: best_template,
-                                frames_analyzed,
-                                liveness_ok: true,
-                                camera_ok: true,
-                                elapsed_ms: 0,
-                                variance: Some(variance.max_diff),
-                                motion: Some(motion.max_motion),
-                                keyring_password: None,
-                                reason: "match".into(),
-                                threshold_used: threshold,
+                            return Ok(VerifyOutcome {
+                                result: VerifyResult {
+                                    matched: true,
+                                    user: user.into(),
+                                    score: best_score,
+                                    template_id: best_template,
+                                    frames_analyzed,
+                                    liveness_ok: true,
+                                    camera_ok: true,
+                                    elapsed_ms: 0,
+                                    variance: Some(variance.max_diff),
+                                    motion: Some(motion.max_motion),
+                                    keyring_password: None,
+                                    reason: "match".into(),
+                                    threshold_used: threshold,
+                                },
+                                best_sample: best_template.zip(best_embedding),
                             });
                         }
                         // Quorum met but liveness is not satisfied yet. Do
@@ -891,20 +1015,24 @@ fn verify_inner(
     } else {
         "no_match"
     };
-    Ok(VerifyResult {
-        matched: false,
-        user: user.into(),
-        score: best_score,
-        template_id: best_template,
-        frames_analyzed,
-        liveness_ok,
-        camera_ok: true,
-        elapsed_ms: 0,
-        variance: Some(variance.max_diff),
-        motion: Some(motion.max_motion),
-        keyring_password: None,
-        reason: reason.into(),
-        threshold_used: threshold,
+    Ok(VerifyOutcome {
+        result: VerifyResult {
+            matched: false,
+            user: user.into(),
+            score: best_score,
+            template_id: best_template,
+            frames_analyzed,
+            liveness_ok,
+            camera_ok: true,
+            elapsed_ms: 0,
+            variance: Some(variance.max_diff),
+            motion: Some(motion.max_motion),
+            keyring_password: None,
+            reason: reason.into(),
+            threshold_used: threshold,
+        },
+        // A failed attempt never refines; the sample is dropped.
+        best_sample: None,
     })
 }
 
@@ -1546,7 +1674,15 @@ pub fn enroll(
                     user: Some(user.into()),
                     score: None,
                     reason: if added > 0 {
-                        None
+                        if outcome.result.min_templates_met {
+                            None
+                        } else {
+                            // Templates were stored, but the user still sits
+                            // below the configured minimum distinct-pose
+                            // count: tell the indicator to nudge them to run
+                            // enrollment again (progress is kept).
+                            Some("insufficient_templates".into())
+                        }
                     } else {
                         Some(outcome.failure_reason.clone())
                     },
@@ -1700,6 +1836,7 @@ fn enroll_inner(
         .map_err(|_| "cfg lock poisoned".to_string())?
         .clone();
     let max_per_user = cfg.security.max_templates_per_user;
+    let min_templates = cfg.recognition.enroll_min_templates;
     let min_area = cfg.recognition.min_face_area;
     let min_sharpness = cfg.recognition.min_sharpness;
     // Enrollment uses its own frame-variance gate, not the verification
@@ -1775,7 +1912,13 @@ fn enroll_inner(
         .map_err(|_| "pipeline lock poisoned".to_string())?;
 
     let existing_templates = load_templates(daemon, user).map_err(|e| e.to_string())?;
-    let target = max_models.min(max_per_user.saturating_sub(existing_templates.len()));
+    let existing = existing_templates.len();
+    // A single run should push the user to at least the minimum distinct
+    // count (unless they already have more): a small `--max` never traps
+    // enrollment below the minimum. The per-user cap still wins.
+    let room = max_per_user.saturating_sub(existing);
+    let want = max_models.max(min_templates.saturating_sub(existing));
+    let target = want.min(room);
 
     // The camera is acquired and ready: only now tell watchers the session
     // has started. Every earlier exit (template limit, no such user, camera
@@ -2028,6 +2171,11 @@ fn enroll_inner(
     } else {
         primary_reject.unwrap_or("no_face").to_string()
     };
+    let total = existing + added;
+    // Soft minimum: whatever was captured is stored (progress is kept
+    // across runs), and the result carries the flag so the CLI and the
+    // status indicator can nudge the user to enroll more poses.
+    let min_templates_met = min_templates == 0 || total >= min_templates;
 
     Ok(EnrollOutcome {
         result: EnrollResult {
@@ -2036,6 +2184,9 @@ fn enroll_inner(
             template_ids,
             reports,
             match_threshold: calibrated_threshold,
+            total_templates: total,
+            min_templates_met,
+            min_templates_required: min_templates,
         },
         target,
         frames: frames_analyzed,
@@ -2433,6 +2584,221 @@ mod tests {
         assert_eq!(
             before, after,
             "failed attempts must not change the threshold"
+        );
+    }
+
+    /// Enrollment is a soft minimum: with the stub pipeline every frame
+    /// embeds (near-)identically, so dedupe keeps only one distinct pose.
+    /// The run must still succeed — storing what it captured — but report
+    /// that the configured minimum was not met, so the CLI/UI can nudge the
+    /// user to run again.
+    #[test]
+    fn enroll_reports_minimum_not_met_when_few_distinct_poses() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        let result = enroll(&daemon, caller, &user, 4).unwrap();
+        assert!(result.added >= 1, "enroll failed: {:?}", result.reports);
+        assert!(
+            !result.min_templates_met,
+            "one distinct pose must not satisfy the default minimum: {result:?}"
+        );
+        assert_eq!(result.min_templates_required, 3);
+        assert_eq!(result.total_templates, result.added);
+    }
+
+    /// With the minimum disabled (0), a single distinct pose meets it.
+    #[test]
+    fn enroll_minimum_zero_accepts_single_pose() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.recognition.enroll_min_templates = 0;
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        let result = enroll(&daemon, caller, &user, 1).unwrap();
+        assert!(result.added >= 1, "enroll failed: {:?}", result.reports);
+        assert!(result.min_templates_met);
+        assert_eq!(result.min_templates_required, 0);
+    }
+
+    /// A granted, confident match blends the live embedding into the
+    /// matched template: the stored ciphertext changes and `refined_at` is
+    /// stamped. (The rate is raised so the mock's near-identical frames
+    /// still produce a measurable change.)
+    #[test]
+    fn granted_verify_refines_matched_template() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.recognition.template_refine_rate = 0.5;
+            cfg.recognition.template_refine_min_margin = 0.0;
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        enroll(&daemon, caller, &user, 4).unwrap();
+
+        let (before, refined_before) = {
+            let store = daemon.store.lock().unwrap();
+            let row = store.list_templates(&user).unwrap().remove(0);
+            (row.ciphertext, row.refined_at)
+        };
+        assert!(refined_before.is_none(), "fresh template must not be refined");
+
+        let result = verify(&daemon, caller, &user, "test-service", 5000, false).unwrap();
+        assert!(result.matched, "verify failed: {result:?}");
+
+        let (after, refined_after, model, dim) = {
+            let store = daemon.store.lock().unwrap();
+            let row = store.list_templates(&user).unwrap().remove(0);
+            (row.ciphertext, row.refined_at, row.model, row.dim)
+        };
+        assert_ne!(before, after, "a granted match must refine the template");
+        assert!(
+            refined_after.is_some(),
+            "refinement must stamp refined_at"
+        );
+        // The refined template must still unseal, still be the same model
+        // shape, and still be the same user: the blend of two near-identical
+        // samples must stay highly similar to the original.
+        let plain = daemon
+            .km
+            .unseal(user.as_bytes(), &after)
+            .expect("refined template must unseal");
+        let refined = Embedding::from_bytes(model.clone(), dim, &plain).expect("valid embedding");
+        let plain_before = daemon
+            .km
+            .unseal(user.as_bytes(), &before)
+            .expect("original template must unseal");
+        let original = Embedding::from_bytes(model, dim, &plain_before).expect("valid embedding");
+        let sim = refined.cosine(&original).expect("same shape");
+        assert!(
+            sim > 0.9,
+            "refinement must preserve identity (sim={sim})"
+        );
+    }
+
+    /// Failed attempts must never refine: an attacker cannot poison the
+    /// template by forcing misses.
+    #[test]
+    fn failed_verify_never_refines_templates() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.recognition.template_refine_rate = 0.5;
+            cfg.recognition.template_refine_min_margin = 0.0;
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        enroll(&daemon, caller, &user, 4).unwrap();
+
+        let before = daemon
+            .store
+            .lock()
+            .unwrap()
+            .list_templates(&user)
+            .unwrap()
+            .remove(0)
+            .ciphertext;
+
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(None);
+        }
+        let result = verify(&daemon, caller, &user, "test-service", 2000, false).unwrap();
+        assert!(!result.matched);
+
+        let after = daemon
+            .store
+            .lock()
+            .unwrap()
+            .list_templates(&user)
+            .unwrap()
+            .remove(0)
+            .ciphertext;
+        assert_eq!(before, after, "failed attempts must not refine");
+    }
+
+    /// Even a match is not enough when the score sits below the refinement
+    /// margin: marginal matches must not drag the template toward an
+    /// impostor.
+    #[test]
+    fn refinement_requires_high_confidence_match() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cfg = daemon.cfg.write().unwrap();
+            cfg.recognition.template_refine_rate = 0.5;
+            // Unreachable: no real score can sit 1.0 above the threshold.
+            cfg.recognition.template_refine_min_margin = 1.0;
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        enroll(&daemon, caller, &user, 4).unwrap();
+
+        let before = daemon
+            .store
+            .lock()
+            .unwrap()
+            .list_templates(&user)
+            .unwrap()
+            .remove(0)
+            .ciphertext;
+
+        let result = verify(&daemon, caller, &user, "test-service", 5000, false).unwrap();
+        assert!(result.matched, "verify failed: {result:?}");
+
+        let after = daemon
+            .store
+            .lock()
+            .unwrap()
+            .list_templates(&user)
+            .unwrap()
+            .remove(0)
+            .ciphertext;
+        assert_eq!(
+            before, after,
+            "a marginal match must not refine the template"
         );
     }
 

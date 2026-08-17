@@ -130,6 +130,26 @@ pub struct RecognitionConfig {
     /// after each successful match (`0.0` disables adaptive tracking).
     /// Adaptation only ever happens on success, never on failure.
     pub auto_threshold_adapt: f32,
+    /// Minimum number of *distinct* templates (poses) a user should have
+    /// enrolled. Enrollment stores whatever it captured and reports
+    /// `min_templates_met: false` while the user's total sits below this,
+    /// so the CLI and status indicator can nudge the user to run again
+    /// (progress is kept across runs). Verification still works with fewer
+    /// templates (e.g. after removing some). `0` disables the minimum.
+    pub enroll_min_templates: usize,
+    /// Adaptive template refinement: after a *granted*, confident match,
+    /// blend the live matched embedding into the template that matched it,
+    /// so the stored template slowly follows the user's appearance
+    /// (haircut, glasses, aging) without a re-enrollment.
+    pub template_refine_enabled: bool,
+    /// EMA rate applied when refining a template (`0.0` disables
+    /// refinement). Refinement only ever happens on granted matches, never
+    /// on failures.
+    pub template_refine_rate: f32,
+    /// The observed match score must sit at least this far above the
+    /// threshold actually used before the sample may refine the template.
+    /// Marginal matches must not drag the template toward an impostor.
+    pub template_refine_min_margin: f32,
 }
 
 impl Default for RecognitionConfig {
@@ -153,6 +173,10 @@ impl Default for RecognitionConfig {
             auto_threshold_min: 0.50,
             auto_threshold_max: 0.90,
             auto_threshold_adapt: 0.02,
+            enroll_min_templates: 3,
+            template_refine_enabled: true,
+            template_refine_rate: 0.10,
+            template_refine_min_margin: 0.05,
         }
     }
 }
@@ -475,6 +499,21 @@ impl Config {
                 "recognition.auto_threshold_adapt must be within [0, 1]",
             ));
         }
+        if !(0.0..=1.0).contains(&self.recognition.template_refine_rate) {
+            return Err(CoreError::config(
+                "recognition.template_refine_rate must be within [0, 1]",
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.recognition.template_refine_min_margin) {
+            return Err(CoreError::config(
+                "recognition.template_refine_min_margin must be within [0, 1]",
+            ));
+        }
+        if self.recognition.enroll_min_templates > self.security.max_templates_per_user {
+            return Err(CoreError::config(
+                "recognition.enroll_min_templates must not exceed security.max_templates_per_user",
+            ));
+        }
         if self.camera.pixel_format.len() != 4 || !self.camera.pixel_format.is_ascii() {
             return Err(CoreError::config(
                 "camera.pixel_format must be a 4-character FourCC such as YUYV or GRAY8",
@@ -635,6 +674,53 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("auto_threshold_min"), "{err}");
+    }
+
+    #[test]
+    fn enrollment_minimum_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.recognition.enroll_min_templates, 3);
+        assert!(
+            cfg.security.max_templates_per_user >= cfg.recognition.enroll_min_templates,
+            "the minimum must fit under the per-user cap"
+        );
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn enrollment_minimum_zero_disables() {
+        let cfg = Config::from_toml("[recognition]\nenroll_min_templates = 0").unwrap();
+        assert_eq!(cfg.recognition.enroll_min_templates, 0);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn enrollment_minimum_must_not_exceed_template_cap() {
+        // Default minimum is 3; a cap of 2 would make the minimum
+        // unreachable, so the combination must be rejected.
+        let err = Config::from_toml("[security]\nmax_templates_per_user = 2").unwrap_err();
+        assert!(
+            err.message.contains("enroll_min_templates"),
+            "expected a minimum-vs-cap conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn template_refinement_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.recognition.template_refine_enabled);
+        assert_eq!(cfg.recognition.template_refine_rate, 0.10);
+        assert_eq!(cfg.recognition.template_refine_min_margin, 0.05);
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_template_refine_rate() {
+        let err = Config::from_toml("[recognition]\ntemplate_refine_rate = 1.5").unwrap_err();
+        assert!(err.message.contains("template_refine_rate"), "{err}");
+        let err =
+            Config::from_toml("[recognition]\ntemplate_refine_min_margin = -0.1").unwrap_err();
+        assert!(err.message.contains("template_refine_min_margin"), "{err}");
     }
 
     #[test]

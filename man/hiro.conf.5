@@ -32,6 +32,16 @@ successful match slowly adapts it toward the observed score at the EMA rate
 \fIauto_threshold_adapt\fR (0 disables tracking; adaptation never runs on
 failures). Set \fIauto_threshold = false\fR to rely on the global
 \fImatch_threshold\fR alone.
+\fIenroll_min_templates\fR (default 3) is the minimum number of distinct
+poses a user should have enrolled: enrollment stores what it captured and
+warns while the total sits below this (progress is kept across runs); 0
+disables the minimum. With \fItemplate_refine_enabled\fR (default true),
+every granted, confident match blends the live matched embedding into the
+template it matched at the EMA rate \fItemplate_refine_rate\fR (default
+0.10; 0 disables), so templates slowly follow the user's appearance;
+refinement requires the score to sit at least
+\fItemplate_refine_min_margin\fR above the threshold used, and never runs
+on failures.
 .TP
 .B [security]
 Rate limiting, lockout, per-user template limit, camera-pinning policy, the

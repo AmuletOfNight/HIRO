@@ -19,6 +19,9 @@ const POP_SETTLE_MS = 120;
 const HIDE_MS = 220;
 const METER_WIDTH = 190;
 const FACE_SCAN_MS = 1200;
+// How long the daemon may lag the scan start with liveness telemetry
+// before the (empty) meter tracks are considered pointless and collapsed.
+const LIVENESS_GRACE_MS = 500;
 // Accent color per status; used by the Cairo-drawn face.
 const FACE_ACCENT = {
     idle: '#c9d1d9',
@@ -50,6 +53,7 @@ export default class HiroStatusExtension extends Extension {
         this._pendingResult = null;
         this._scanStartedAt = 0;
         this._animationToken = 0;
+        this._morphToken = 0;
         this._pulseToken = 0;
         this._faceAnimationToken = 0;
         this._faceState = null;
@@ -82,6 +86,9 @@ export default class HiroStatusExtension extends Extension {
         // Centered overlay with the animated "scanning" message. Lives in
         // the overlay layer when available so it also renders above the
         // screen shield; falls back to the main UI group otherwise.
+        // The card is positioned explicitly on the primary monitor (the
+        // host group does not center children); _positionOverlay re-centres
+        // it whenever the size changes.
         this._overlay = new St.Bin({
             style_class: 'hiro-status-overlay',
             reactive: false,
@@ -93,6 +100,21 @@ export default class HiroStatusExtension extends Extension {
         });
         this._overlay.set_translation(0, 0, 0);
         this._overlay.set_pivot_point(0.5, 0.5);
+        this._lastOverlayW = 0;
+        this._lastOverlayH = 0;
+        // Keep the card centred on the primary monitor on every size change:
+        // re-position whenever the overlay's allocation size changes (which
+        // happens each frame while a size morph is running).
+        this._overlay.connect('notify::allocation', () => {
+            if (!this._overlay) return;
+            const alloc = this._overlay.get_allocation_box();
+            const w = alloc.get_width();
+            const h = alloc.get_height();
+            if (w < 1 || h < 1 || (w === this._lastOverlayW && h === this._lastOverlayH)) return;
+            this._lastOverlayW = w;
+            this._lastOverlayH = h;
+            this._centerOverlay(w, h);
+        });
         this._column = new St.BoxLayout({style_class: 'hiro-status-column', vertical: true});
 
         this._brandRow = new St.BoxLayout({style_class: 'hiro-brand-row', vertical: false});
@@ -108,20 +130,29 @@ export default class HiroStatusExtension extends Extension {
         }));
         this._column.add_child(this._brandRow);
 
-        this._box = new St.BoxLayout({style_class: 'hiro-status-box', vertical: false});
-        this._face = this._makeFace();
-        this._setFaceState('idle');
+        // Body (crossfaded as a unit on result transitions): the status
+        // label on top, then the face with the liveness meters beside it.
+        this._body = new St.BoxLayout({style_class: 'hiro-status-body', vertical: true});
         this._label = new St.Label({
             text: 'Scanning your face',
             style_class: 'hiro-status-label',
         });
-        this._box.add_child(this._face);
-        this._box.add_child(this._label);
-        this._column.add_child(this._box);
+        // Fill the card width so the text block stays the same size whether
+        // it says "Scanning your face…" or "✓ Verified (97%)" (text is
+        // centred via CSS).
+        this._label.x_align = Clutter.ActorAlign.FILL;
+        this._body.add_child(this._label);
+
+        this._box = new St.BoxLayout({style_class: 'hiro-status-box', vertical: false});
+        this._box.x_align = Clutter.ActorAlign.CENTER;
+        this._face = this._makeFace();
+        this._setFaceState('idle');
 
         // Live liveness progress meter: one bar per anti-spoof signal
         // (temporal frame variance and landmark micro-motion), fed by the
-        // daemon's scanning telemetry, plus an actionable hint.
+        // daemon's scanning telemetry, plus an actionable hint. Shown
+        // empty from the first scanning frame so the card's layout is
+        // stable while the bars fill in.
         this._varianceFill = new St.Widget({
             style_class: 'hiro-meter-fill hiro-meter-fill-var',
             height: 8,
@@ -138,14 +169,21 @@ export default class HiroStatusExtension extends Extension {
         this._meter.add_child(this._makeMeterRow('Scene motion', this._varianceFill));
         this._meter.add_child(this._makeMeterRow('Head motion', this._motionFill));
         this._meter.visible = false;
-        this._column.add_child(this._meter);
 
         this._hint = new St.Label({
             text: 'Move your head slightly',
             style_class: 'hiro-status-hint',
             visible: false,
         });
-        this._column.add_child(this._hint);
+
+        this._side = new St.BoxLayout({style_class: 'hiro-status-side', vertical: true});
+        this._side.add_child(this._meter);
+        this._side.add_child(this._hint);
+
+        this._box.add_child(this._face);
+        this._box.add_child(this._side);
+        this._body.add_child(this._box);
+        this._column.add_child(this._body);
 
         // Approval prompt: shown after a confident match when the requesting
         // service (sudo, lock, polkit, ...) needs an explicit Allow/Deny
@@ -169,13 +207,17 @@ export default class HiroStatusExtension extends Extension {
             vertical: false,
             visible: false,
         });
+        // Each button takes exactly half the dialog width, spanning the full
+        // bottom of the card.
         this._allowBtn = new St.Button({
             label: 'Allow',
             style_class: 'hiro-approval-btn hiro-approval-allow',
+            x_expand: true,
         });
         this._denyBtn = new St.Button({
             label: 'Deny',
             style_class: 'hiro-approval-btn hiro-approval-deny',
+            x_expand: true,
         });
         this._allowBtn.connect('clicked', () => this._decideApproval(true));
         this._denyBtn.connect('clicked', () => this._decideApproval(false));
@@ -189,7 +231,8 @@ export default class HiroStatusExtension extends Extension {
         this._overlay.set_child(this._column);
         // The lock screen (screen shield) covers the normal overlay layer,
         // so while locked the indicator must live inside the shield group to
-        // stay visible. Move it between parents as the lock state changes.
+        // stay visible. Move the overlay between parents as the lock state
+        // changes.
         this._updateOverlayParent = () => {
             if (!this._overlay) return;
             const locked = Main.screenShield?.locked ?? false;
@@ -219,6 +262,9 @@ export default class HiroStatusExtension extends Extension {
         }
         this._stopAnimations();
         this._cancelOverlayAnimation();
+        this._morphToken++;
+        if (this._column) this._column.remove_all_transitions();
+        this._unpinOverlaySize();
         this._stopApprovalTimer();
         if (this._dotTimer) GLib.source_remove(this._dotTimer);
         if (this._retry) GLib.source_remove(this._retry);
@@ -232,8 +278,11 @@ export default class HiroStatusExtension extends Extension {
         if (this._approvalBox) this._approvalBox.destroy();
         this._approvalBox = null;
         if (this._overlay) this._overlay.destroy();
-        if (this._indicator) this._indicator.destroy();
         this._overlay = null;
+        this._column = null;
+        this._body = null;
+        this._side = null;
+        if (this._indicator) this._indicator.destroy();
         this._indicator = null;
         this._icon = null;
         this._face = null;
@@ -636,6 +685,7 @@ export default class HiroStatusExtension extends Extension {
             this._cancelResultTimer();
             this._pendingResult = null;
             const enteringScanning = this._state !== 'scanning' || !this._overlay.visible;
+            const wasVisible = this._overlay.visible;
             if (enteringScanning) {
                 this._state = 'scanning';
                 this._scanStartedAt = GLib.get_monotonic_time();
@@ -647,6 +697,10 @@ export default class HiroStatusExtension extends Extension {
                 : 'system-status-icon hiro-scanning';
             this._startPulse();
             this._startDots();
+            // Set the meter layout *before* the overlay is shown/pop-in so
+            // the first frame already has the final card shape (verify
+            // shows the empty tracks; enroll has none).
+            this._setMeterVisible(!this._enrolling);
             this._showOverlay(
                 this._enrolling ? 'Enrolling your face' : 'Scanning your face',
                 this._enrolling ? 'contact-new-symbolic' : 'camera-photo-symbolic',
@@ -657,19 +711,24 @@ export default class HiroStatusExtension extends Extension {
                 // instead (live "n/target" count from the daemon) plus a
                 // live hint whenever a frame is rejected for a fixable
                 // reason (too close/far, blurry, duplicate pose, ...).
-                this._setMeterVisible(false);
                 this._setEnrollProgress(accepted, target);
                 this._setEnrollHint(reason);
             } else {
                 this._updateLiveness(variance, motion, minVariance, minMotion);
             }
+            // A scan arriving over a live card (approval → scan) must morph
+            // the size; a fresh entry is already animated by _popIn.
+            if (enteringScanning && wasVisible) this._morphOverlay();
         } else if (state === 'success') {
-            this._clearApproval();
+            // Keep the approval box visible so _transitionToResult can fade
+            // it out and morph the card smoothly.
+            this._clearApproval(false);
             this._queueResult(state, score, reason, accepted, target, rejected);
         } else if (state === 'failure') {
-            this._clearApproval();
+            this._clearApproval(false);
             this._queueResult(state, score, reason, accepted, target, rejected);
         } else {
+            // idle or any unknown state: hide everything.
             this._clearApproval();
             this._cancelResultTimer();
             this._pendingResult = null;
@@ -680,6 +739,9 @@ export default class HiroStatusExtension extends Extension {
             this._target = null;
             this._stopAnimations();
             this._cancelOverlayAnimation();
+            // Freeze the card at its current size while it fades out, so
+            // the meters disappearing cannot snap it.
+            this._pinOverlaySize();
             this._setMeterVisible(false);
             this._animateOverlayOut(() => {
                 if (this._state === state) {
@@ -692,16 +754,26 @@ export default class HiroStatusExtension extends Extension {
 
     _updateLiveness(variance, motion, minVariance, minMotion) {
         if (!this._meter || !this._hint) return;
+        // The meters are shown empty from the first scanning frame (see
+        // setState); this handler only ever updates their fills and hint
+        // text. Telemetry may lag the scan start by a few frames; if none
+        // ever arrives (liveness disabled), collapse the empty tracks after
+        // a grace period so the card is not left with pointless bars.
         if (minVariance == null || minMotion == null ||
             variance == null || motion == null) {
-            this._setMeterVisible(false);
+            if (this._scanStartedAt &&
+                (GLib.get_monotonic_time() - this._scanStartedAt) / 1000 > LIVENESS_GRACE_MS) {
+                this._setMeterVisible(false);
+                this._morphOverlay();
+            }
             return;
         }
-        this._setMeterVisible(true);
         const vOk = variance >= minVariance;
         const mOk = motion >= minMotion;
-        this._varianceFill.set_width(Math.round(this._barFraction(variance, minVariance) * METER_WIDTH));
-        this._motionFill.set_width(Math.round(this._barFraction(motion, minMotion) * METER_WIDTH));
+        this._animateFill(this._varianceFill,
+            Math.round(this._barFraction(variance, minVariance) * METER_WIDTH));
+        this._animateFill(this._motionFill,
+            Math.round(this._barFraction(motion, minMotion) * METER_WIDTH));
         this._varianceFill.style_class =
             `hiro-meter-fill ${vOk ? 'hiro-meter-fill-ok' : 'hiro-meter-fill-var'}`;
         this._motionFill.style_class =
@@ -709,6 +781,18 @@ export default class HiroStatusExtension extends Extension {
         this._hint.text = vOk && mOk
             ? 'Good — hold still'
             : 'Move your head slightly';
+    }
+
+    // Ease a meter fill toward its new width instead of snapping, so the
+    // bars grow smoothly as telemetry streams in. A newer tick cancels the
+    // in-flight tween and retargets from the current width.
+    _animateFill(fill, targetWidth) {
+        if (!fill) return;
+        fill.remove_all_transitions();
+        fill.ease_property('width', targetWidth, {
+            duration: 200,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
     }
 
     _setEnrollProgress(accepted, target) {
@@ -735,7 +819,10 @@ export default class HiroStatusExtension extends Extension {
                 this._hintText = hint;
                 this._hintAt = now;
             }
+            const becameVisible = !this._hint.visible;
             this._hint.visible = true;
+            // Growing the side column (hint appears) morphs the card size.
+            if (becameVisible) this._morphOverlay();
         }
         // reason === null means a frame was accepted: leave the hint as-is
         // rather than hiding/re-showing it, so it doesn't blink between
@@ -764,7 +851,6 @@ export default class HiroStatusExtension extends Extension {
         if (this._meter.visible === visible) return;
         this._meter.visible = visible;
         this._hint.visible = visible;
-        if (visible) this._positionOverlay();
     }
 
     // --- Approval prompt (action-approval gate) ---
@@ -795,7 +881,7 @@ export default class HiroStatusExtension extends Extension {
         if (this._approval && this._approval.id === approvalId) {
             this._approval.userPresent = userPresent !== false;
             this._updateApprovalButtons();
-            this._positionOverlay();
+            this._morphOverlay();
             return;
         }
 
@@ -803,9 +889,10 @@ export default class HiroStatusExtension extends Extension {
         // Buttons must be clickable, so the overlay becomes reactive while
         // the prompt is up.
         this._overlay.reactive = true;
-        this._setMeterVisible(false);
-        if (this._hint) this._hint.visible = false;
-
+        // Keep the meter tracks in the layout (the card keeps the scan card's
+        // width) but fade them out and glide the smiley to the centre — the
+        // same face position the verified card will use, so the result
+        // transition afterwards is barely a change.
         this._showOverlay('Approve this action?', 'security-high-symbolic', 'hiro-approval');
         this._approvalTitle.text = `${svc} wants to authenticate as ${user || 'you'}`;
         this._approvalBox.visible = true;
@@ -822,7 +909,25 @@ export default class HiroStatusExtension extends Extension {
         };
         this._updateApprovalButtons();
         this._startApprovalTimer();
-        this._positionOverlay();
+        if (this._side) {
+            this._side.remove_all_transitions();
+            this._side.ease_property('opacity', 0, {
+                duration: 200,
+                mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+            });
+        }
+        if (this._face) {
+            const boxW = this._box.get_width();
+            const faceW = this._face.get_width() || 96;
+            const targetX = boxW > faceW ? (boxW - faceW) / 2 : 0;
+            this._face.remove_all_transitions();
+            this._face.ease_property('translation-x', targetX, {
+                duration: 280,
+                mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+            });
+        }
+        // Grow the card to include the prompt, centred.
+        this._morphOverlay();
     }
 
     _updateApprovalButtons() {
@@ -883,10 +988,12 @@ export default class HiroStatusExtension extends Extension {
         // The daemon broadcasts the terminal failure event shortly after.
     }
 
-    _clearApproval() {
+    _clearApproval(hideBox = true) {
         this._stopApprovalTimer();
         this._approval = null;
-        if (this._approvalBox) this._approvalBox.visible = false;
+        // When hideBox is false the box is left visible so the result
+        // transition can fade it out smoothly.
+        if (hideBox && this._approvalBox) this._approvalBox.visible = false;
         if (this._overlay) this._overlay.reactive = false;
     }
 
@@ -964,6 +1071,8 @@ export default class HiroStatusExtension extends Extension {
             return 'Duplicate pose — turn your head a little';
         if (r.includes('no_luma'))
             return 'Camera frames unreadable';
+        if (r.includes('insufficient_templates'))
+            return 'More poses needed — run `hiro enroll` again';
         if (r.includes('no_templates') || r.includes('no template'))
             return 'No face enrolled yet';
         if (r.includes('template_limit'))
@@ -992,6 +1101,9 @@ export default class HiroStatusExtension extends Extension {
             this._cancelHideTimer();
             this._stopAnimations();
             this._cancelOverlayAnimation();
+            // No scan happened, so no meter tracks either: show the verdict
+            // as a compact card.
+            this._setMeterVisible(false);
             this._pendingResult = {state, score, reason, accepted, target, rejected};
             this._state = state;
             this._presentResult();
@@ -1032,7 +1144,11 @@ export default class HiroStatusExtension extends Extension {
 
         this._resultTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, waitMs, () => {
             this._resultTimer = null;
-            if (this._state !== 'scanning' || !this._pendingResult) return false;
+            // The result may arrive while an approval prompt is up (user
+            // clicked Allow/Deny, or the decision window expired); both
+            // 'scanning' and 'approval_pending' are valid pre-result states.
+            if ((this._state !== 'scanning' && this._state !== 'approval_pending') ||
+                !this._pendingResult) return false;
             this._presentResult();
             return false;
         });
@@ -1046,8 +1162,9 @@ export default class HiroStatusExtension extends Extension {
         this._showIndicator();
         this._state = result.state;
         this._stopAnimations();
-        this._setMeterVisible(false);
-        if (this._hint) this._hint.visible = false;
+        // The meters/hint stay in the layout and are faded out by the
+        // transition, so the verified card keeps the scanning card's size
+        // instead of shrinking.
         const warn = this._isImmediateFailure(result.state, result.reason);
         this._icon.style_class =
             `system-status-icon ${result.state === 'success' ? 'hiro-ok' : (warn ? 'hiro-warn' : 'hiro-fail')}`;
@@ -1057,7 +1174,16 @@ export default class HiroStatusExtension extends Extension {
         if (result.state === 'success') {
             if (this._enrolling) {
                 const n = this._enrollCount(result);
-                text = `✓ ${n} face template${n === 1 ? '' : 's'} enrolled`;
+                if (result.reason === 'insufficient_templates') {
+                    // Templates were stored, but the user still sits below
+                    // the minimum distinct-pose count: keep the success
+                    // frame and nudge them to run enrollment again.
+                    const missing = Math.max(0, (result.target || n) - n);
+                    text = `✓ ${n} face template${n === 1 ? '' : 's'} enrolled — ` +
+                        `${missing} more pose${missing === 1 ? '' : 's'} needed`;
+                } else {
+                    text = `✓ ${n} face template${n === 1 ? '' : 's'} enrolled`;
+                }
             } else {
                 text = `✓  Verified${result.score ? ' (' + (result.score * 100).toFixed(0) + '%)' : ''}`;
             }
@@ -1111,70 +1237,247 @@ export default class HiroStatusExtension extends Extension {
             this._setFaceState(faceState);
         }
         this._overlay.style_class = 'hiro-status-overlay ' + (extraClass || '');
+        // A previous state can leave the card mid-animation (interrupted
+        // pop-in, mid-fade hide); always show a fully visible card, then
+        // _popIn may animate the entrance on top of that.
+        this._overlay.remove_all_transitions();
+        this._overlay.opacity = 255;
+        this._overlay.set_scale(1, 1);
         this._overlay.visible = true;
         this._positionOverlay();
         if (animate) this._popIn();
     }
 
+    // Position the card centred on the primary monitor. For a fresh show the
+    // allocation may not exist yet, so fall back to the natural size; for a
+    // visible card it uses the current allocation (the actual visual size),
+    // so content changes never jump the card before a morph re-centres it.
     _positionOverlay() {
-        // uiGroup's layout does not center children, so place it explicitly
-        // relative to the primary monitor, centered both ways.
-        const [, natW] = this._overlay.get_preferred_width(-1);
-        const [, natH] = this._overlay.get_preferred_height(-1);
+        if (!this._overlay) return;
+        const alloc = this._overlay.get_allocation_box();
+        let w = alloc.get_width();
+        let h = alloc.get_height();
+        if (w < 1 || h < 1) {
+            const [, natW] = this._overlay.get_preferred_width(-1);
+            const [, natH] = this._overlay.get_preferred_height(-1);
+            w = natW;
+            h = natH;
+        }
+        this._lastOverlayW = w;
+        this._lastOverlayH = h;
+        this._centerOverlay(w, h);
+    }
+
+    _centerOverlay(w, h) {
         const mon = Main.layoutManager.primaryMonitor;
-        const x = Math.round(mon.x + (mon.width - natW) / 2);
-        const y = Math.round(mon.y + (mon.height - natH) / 2);
+        const x = Math.round(mon.x + (mon.width - w) / 2);
+        const y = Math.round(mon.y + (mon.height - h) / 2);
         this._overlay.set_position(x, y);
+    }
+
+    // --- Size morphing ---
+    //
+    // St re-layouts instantly when children appear/disappear, which is what
+    // made the meters and approval box pop. To animate a size change the
+    // column is pinned to its current size (so the content swap cannot
+    // jump), then its explicit width/height are eased to the new natural
+    // size with clipping, and finally reset to natural (-1).
+
+    _pinOverlaySize() {
+        if (!this._column) return;
+        const alloc = this._column.get_allocation_box();
+        const w = alloc.get_width();
+        const h = alloc.get_height();
+        if (w < 1 || h < 1) return; // not laid out yet — nothing to pin
+        this._column.remove_all_transitions();
+        this._column.set_width(w);
+        this._column.set_height(h);
+        this._column.set_clip_to_allocation(true);
+    }
+
+    _unpinOverlaySize() {
+        if (!this._column) return;
+        this._column.set_width(-1);
+        this._column.set_height(-1);
+        this._column.set_clip_to_allocation(false);
+    }
+
+    // Morph the card to its current natural size. Call after the content is
+    // in its final state; the current (possibly stale) allocation becomes
+    // the start of the ease. No-op when the size already matches.
+    _morphOverlay(onComplete = null) {
+        if (!this._overlay || !this._column) {
+            if (onComplete) onComplete();
+            return;
+        }
+        const token = ++this._morphToken;
+        // Natural size is computed from the *current* content, so any
+        // explicit size left over from a previous morph must be cleared
+        // first (St's get_preferred_* returns an explicit size verbatim).
+        this._unpinOverlaySize();
+        const [, natW] = this._column.get_preferred_width(-1);
+        const [, natH] = this._column.get_preferred_height(-1);
+        const alloc = this._column.get_allocation_box();
+        const curW = alloc.get_width();
+        const curH = alloc.get_height();
+        if (curW < 1 || curH < 1 ||
+            (Math.abs(curW - natW) < 1 && Math.abs(curH - natH) < 1)) {
+            if (onComplete) onComplete();
+            return;
+        }
+        this._column.remove_all_transitions();
+        this._column.set_width(curW);
+        this._column.set_height(curH);
+        this._column.set_clip_to_allocation(true);
+        // The overlay's notify::allocation handler re-centres the card on
+        // every size change, so no per-frame hook is needed here.
+        this._column.ease_property('width', natW, {
+            duration: TRANSITION_MS,
+            mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+        });
+        this._column.ease_property('height', natH, {
+            duration: TRANSITION_MS,
+            mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+            onComplete: () => {
+                if (token !== this._morphToken) return;
+                this._unpinOverlaySize();
+                this._positionOverlay();
+                if (onComplete) onComplete();
+            },
+        });
     }
 
     _transitionToResult(text, iconName, extraClass) {
         const token = ++this._animationToken;
         this._overlay.remove_all_transitions();
+        // A cancelled pop-in can leave the card mid-fade/scale; reset so the
+        // transitions below operate on a fully visible card.
+        this._overlay.opacity = 255;
+        this._overlay.set_scale(1, 1);
         if (!this._overlay.visible) {
             this._showOverlay(text, iconName, extraClass, false);
             this._popIn(token);
             return;
         }
 
-        // Crossfade only the content row (face + label) instead of flashing
-        // the whole card. The brand, meters, and chrome stay put, so a
-        // scan -> result change reads as a smooth re-morph of the face
-        // rather than a jarring card swap.
-        this._box.remove_all_transitions();
-        this._box.ease_property('opacity', 0, {
+        // The verified card keeps the scanning card's dimensions: the meters
+        // and hint fade out in place (still occupying layout space) while
+        // the label crossfades to the verdict and the smiley fades to the
+        // result accent while gliding to the centre of the card.
+        const label = this._label;
+        const face = this._face;
+        const side = this._side;
+
+        // Where the smiley ends up: centred in the content row. If the side
+        // column is empty (compact verdict, no meter tracks), leave the face
+        // where the (collapsed, re-centred) layout puts it.
+        const sideVisible = this._meter.visible || this._hint.visible;
+        const boxW = this._box.get_width();
+        const faceW = face.get_width() || 96;
+        const targetX = sideVisible && boxW > faceW ? (boxW - faceW) / 2 : 0;
+
+        label.remove_all_transitions();
+        face.remove_all_transitions();
+        side.remove_all_transitions();
+
+        // If an approval prompt was up, fade it out and let the card morph
+        // to the result layout instead of snapping to the compact size.
+        if (this._approvalBox && this._approvalBox.visible) {
+            const approvalBox = this._approvalBox;
+            approvalBox.remove_all_transitions();
+            approvalBox.ease_property('opacity', 0, {
+                duration: TRANSITION_MS,
+                mode: Clutter.AnimationMode.EASE_IN_QUAD,
+                onComplete: () => {
+                    if (token !== this._animationToken) return;
+                    approvalBox.visible = false;
+                    approvalBox.opacity = 255;
+                    this._morphOverlay();
+                },
+            });
+        }
+
+        // Fade the label out, swap the text (and the face accent) while it
+        // is gone, then fade back in.
+        label.ease_property('opacity', 0, {
             duration: TRANSITION_MS,
             mode: Clutter.AnimationMode.EASE_IN_QUAD,
             onComplete: () => {
                 if (token !== this._animationToken) return;
                 this._showOverlay(text, iconName, extraClass, false);
-                this._box.opacity = 0;
-                this._box.ease_property('opacity', 255, {
+                label.opacity = 0;
+                label.ease_property('opacity', 255, {
                     duration: POP_IN_MS,
                     mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                 });
-                if (this._face) {
-                    this._face.set_scale(0.92, 0.92);
-                    this._face.ease_property('scale-x', 1, {
-                        duration: POP_IN_MS,
-                        mode: Clutter.AnimationMode.EASE_OUT_BACK,
-                    });
-                    this._face.ease_property('scale-y', 1, {
-                        duration: POP_IN_MS,
-                        mode: Clutter.AnimationMode.EASE_OUT_BACK,
-                    });
-                }
+                face.opacity = 0;
+                face.ease_property('opacity', 255, {
+                    duration: POP_IN_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                });
+                face.set_scale(0.92, 0.92);
+                face.ease_property('scale-x', 1, {
+                    duration: POP_IN_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_BACK,
+                });
+                face.ease_property('scale-y', 1, {
+                    duration: POP_IN_MS,
+                    mode: Clutter.AnimationMode.EASE_OUT_BACK,
+                });
             },
         });
+        // The face fades out in parallel (the accent swap happens under the
+        // fade) and glides toward the centre.
+        face.ease_property('opacity', 0, {
+            duration: TRANSITION_MS,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+        });
+        face.ease_property('translation-x', targetX, {
+            duration: 280,
+            mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+        });
+        // The meters + hint fade out for good, but stay in the layout so the
+        // card keeps its width.
+        side.ease_property('opacity', 0, {
+            duration: POP_IN_MS,
+            mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+        });
+    }
+
+    // Reset everything the result transition left behind (transparent
+    // meters, shifted smiley) so the next state starts from a clean layout.
+    // Defensive: a failure here must never abort a state transition.
+    _resetResultLayout() {
+        try {
+            if (!this._label || !this._face || !this._side) return;
+            if (this._overlay) {
+                this._overlay.remove_all_transitions();
+                this._overlay.opacity = 255;
+                this._overlay.set_scale(1, 1);
+            }
+            if (this._body) {
+                this._body.remove_all_transitions();
+                this._body.opacity = 255;
+            }
+            this._label.remove_all_transitions();
+            this._label.opacity = 255;
+            this._face.remove_all_transitions();
+            this._face.opacity = 255;
+            this._face.set_scale(1, 1);
+            this._face.set_translation(0, 0, 0);
+            this._side.remove_all_transitions();
+            this._side.opacity = 255;
+        } catch (e) {
+            console.log(`hiro-status: reset layout: ${e?.message}`);
+        }
     }
 
     _popIn(token = ++this._animationToken) {
         this._overlay.remove_all_transitions();
-        this._overlay.opacity = 0;
+        // The card is always at full opacity; only the scale pops, so an
+        // interrupted entrance can never leave the card invisible.
+        this._overlay.opacity = 255;
         this._overlay.set_scale(0.94, 0.94);
-        this._overlay.ease_property('opacity', 255, {
-            duration: POP_IN_MS,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-        });
         this._overlay.ease_property('scale-x', 1.03, {
             duration: POP_IN_MS,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
@@ -1211,6 +1514,8 @@ export default class HiroStatusExtension extends Extension {
                 this._overlay.hide();
                 this._overlay.opacity = 255;
                 this._overlay.set_scale(1, 1);
+                this._unpinOverlaySize();
+                this._resetResultLayout();
                 if (onComplete) onComplete();
             },
         });
@@ -1226,7 +1531,17 @@ export default class HiroStatusExtension extends Extension {
 
     _cancelOverlayAnimation() {
         this._animationToken++;
+        this._morphToken++;
         if (this._overlay) this._overlay.remove_all_transitions();
+        if (this._column) this._column.remove_all_transitions();
+        // An interrupted result crossfade can leave the body mid-fade; the
+        // next state must start from a fully visible, clean layout.
+        if (this._body) {
+            this._body.remove_all_transitions();
+            this._body.opacity = 255;
+        }
+        this._unpinOverlaySize();
+        this._resetResultLayout();
     }
 
     _startPulse() {

@@ -9,6 +9,9 @@
 .hiro-status-column {
     spacing: 14px;
 }
+.hiro-status-body {
+    spacing: 12px;
+}
 .hiro-brand-row {
     spacing: 6px;
     padding-bottom: 1px;
@@ -30,9 +33,13 @@
     spacing: 18px;
     padding: 0 3px;
 }
+.hiro-status-side {
+    spacing: 10px;
+}
 .hiro-status-label {
     font-size: 20px;
     font-weight: bold;
+    text-align: center;
 }
 .hiro-status-meter {
     spacing: 8px;
@@ -111,14 +118,15 @@
 }
 .hiro-approval-buttons {
     spacing: 10px;
-    padding-top: 8px;
-    padding-bottom: 4px;
+    padding-top: 10px;
+    padding-bottom: 2px;
 }
 .hiro-approval-btn {
-    padding: 9px 26px;
-    border-radius: 18px;
+    padding: 12px 0;
+    border-radius: 14px;
     font-size: 15px;
     font-weight: bold;
+    text-align: center;
 }
 .hiro-approval-allow {
     background-color: #2e7d32;

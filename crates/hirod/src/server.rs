@@ -667,6 +667,7 @@ fn list(daemon: &SharedDaemon, caller: Caller, user: &str) -> Result<Vec<Templat
         .map(|r| TemplateInfo {
             id: r.id,
             created_at: r.created_at,
+            refined_at: r.refined_at,
             quality: r.quality,
             device: None,
         })

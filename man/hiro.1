@@ -17,7 +17,12 @@ quality feedback; frames that are blurry, too small, or duplicates are
 rejected automatically, and you can hold each pose for a sharp capture
 (no constant movement is required). The optional
 \fBrecognition.enroll_min_variance\fR setting re-enables rejecting static
-frames when enforced. With \fBrecognition.auto_threshold\fR (default on),
+frames when enforced. A run should leave you with at least
+\fBrecognition.enroll_min_templates\fR (default 3) \fIdistinct\fR poses;
+when it does not, the captured templates are kept and hiro tells you to run
+\fBenroll\fR again, turning your head between captures (a requested
+\fB--max\fR below the remaining minimum is raised automatically). With
+\fBrecognition.auto_threshold\fR (default on),
 enrollment ends with a short calibration pass that measures your genuine
 match scores and stores a per-user match threshold; the calibrated value is
 printed and shown in \fBhiro test\fR output as \fBthreshold\fR. Re-enroll to

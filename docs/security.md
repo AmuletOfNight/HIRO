@@ -76,6 +76,55 @@ their own threshold:
   score seen so you can observe the drift. Set `auto_threshold = false` to
   fall back to the single global threshold for everyone.
 
+### Minimum enrollment diversity
+
+`recognition.enroll_min_templates` (default 3) sets the minimum number of
+*distinct* templates (poses) a user should have enrolled. Templates are
+distinct by construction — `dedupe_threshold` rejects near-duplicate poses —
+so the count is a proxy for pose diversity: a single template covers one
+head angle, and a user whose capture conditions shift (angle, lighting,
+expression) can drop below the match threshold on every frame.
+
+Enrollment does not hard-fail below the minimum. Whatever was captured is
+stored, and the run reports `min_templates_met: false`; the CLI and the
+status indicator tell the user to run `hiro enroll` again (progress is kept
+across runs, and a requested `--max` below the remaining minimum is raised
+automatically). Verification still works with fewer templates — a user who
+deliberately removed templates keeps face auth. Set the minimum to `0` to
+disable the nudging.
+
+There is also a *maximum* (`security.max_templates_per_user`, default 16),
+for a different reason: every verification frame is compared against
+*every* stored template (512-D cosine), so the cap bounds per-frame CPU
+cost and database growth. Pose diversity beyond a handful of templates has
+sharply diminishing returns; the defaults (3–16) bracket that.
+
+### Template refinement (adaptive enrollment)
+
+With `recognition.template_refine_enabled` (default on), every *granted*
+match slowly updates the template it matched: the live embedding of the
+best-scoring frame is blended into the stored template at the EMA rate
+`template_refine_rate` (default 0.10), so the template follows the user's
+appearance (haircut, glasses, aging) without a re-enrollment.
+
+Safety mirrors the threshold adaptation:
+
+- Refinement runs **only after access is granted** — the action-approval
+  gate (where applicable) has already resolved, and failed attempts never
+  refine, so an attacker cannot poison the template without first passing
+  the match threshold, quorum, and liveness gate.
+- Only high-confidence samples refine: the observed score must sit at least
+  `template_refine_min_margin` (default 0.05) above the threshold actually
+  used, so marginal matches cannot drag the template toward an impostor.
+- The EMA rate is small, so drift is slow, and writes are bounded by the
+  same rate limiting and camera budget as any other authentication.
+- The refined template is re-encrypted under the user-bound AEAD (the same
+  sealing as enrollment) and the write is audited as a `template_refine`
+  event. `hiro list` shows the last refinement time.
+
+`template_refine_rate = 0` disables refinement; set
+`template_refine_enabled = false` to turn the feature off outright.
+
 ### Camera pinning
 
 Enrollment records a camera **binding**: the USB identity

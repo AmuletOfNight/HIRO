@@ -34,6 +34,16 @@ const APPROVAL_TICK_MS: u64 = 250;
 const FADE_STEP_MS: u64 = 16;
 const FADE_IN_MS: u64 = 150;
 const FADE_OUT_MS: u64 = 200;
+/// Window resize easing length and step (smooth grow/shrink on content
+/// changes, matching the extension's size morph).
+const RESIZE_MS: u64 = 200;
+const RESIZE_STEP_MS: u64 = 16;
+/// Meter fill easing length and step (bars grow instead of snapping).
+const FILL_MS: u64 = 200;
+const FILL_STEP_MS: u64 = 16;
+/// How long the daemon may lag the scan start with liveness telemetry
+/// before the (empty) meter tracks are considered pointless and collapsed.
+const LIVENESS_GRACE_MS: u128 = 500;
 
 const CSS: &str = r#"
 window {
@@ -54,6 +64,7 @@ window {
 #hiro-label {
     color: #c9d1d9;
     font-size: 17px;
+    text-align: center;
 }
 #hiro-hint {
     color: #768390;
@@ -86,7 +97,7 @@ progressbar.hiro-meter-ok > trough > progress { background-color: #66bb6a; }
 }
 button.hiro-approval-btn {
     border-radius: 8px;
-    padding: 10px 26px;
+    padding: 12px 0;
     font-weight: bold;
     border: none;
 }
@@ -121,7 +132,6 @@ struct ResultInfo {
     score: Option<f32>,
     reason: Option<String>,
     accepted: Option<usize>,
-    #[allow(dead_code)] // kept for parity with the daemon's enroll fields
     target: Option<usize>,
 }
 
@@ -132,6 +142,10 @@ pub struct App {
     socket: PathBuf,
 
     window: gtk::Window,
+    card: gtk::Box,
+    body: gtk::Box,
+    content: gtk::Box,
+    side: gtk::Box,
     status_label: gtk::Label,
     face: gtk::DrawingArea,
     meter_box: gtk::Box,
@@ -170,6 +184,11 @@ pub struct App {
     hide_timer: Option<glib::SourceId>,
     approval_timer: Option<glib::SourceId>,
     fade_timer: Option<glib::SourceId>,
+    resize_timer: Option<glib::SourceId>,
+    fill_timer_var: Option<glib::SourceId>,
+    fill_timer_mot: Option<glib::SourceId>,
+    crossfade_timer: Option<glib::SourceId>,
+    approval_fade_timer: Option<glib::SourceId>,
 }
 
 impl App {
@@ -179,6 +198,10 @@ impl App {
             self_rc: None,
             socket,
             window: gtk::Window::new(gtk::WindowType::Toplevel),
+            card: gtk::Box::new(gtk::Orientation::Vertical, 10),
+            body: gtk::Box::new(gtk::Orientation::Vertical, 8),
+            content: gtk::Box::new(gtk::Orientation::Horizontal, 14),
+            side: gtk::Box::new(gtk::Orientation::Vertical, 8),
             status_label: gtk::Label::new(None),
             face: gtk::DrawingArea::new(),
             meter_box: gtk::Box::new(gtk::Orientation::Vertical, 4),
@@ -211,6 +234,11 @@ impl App {
             hide_timer: None,
             approval_timer: None,
             fade_timer: None,
+            resize_timer: None,
+            fill_timer_var: None,
+            fill_timer_mot: None,
+            crossfade_timer: None,
+            approval_fade_timer: None,
         }));
         rc.borrow_mut().self_rc = Some(rc.clone());
         rc.borrow_mut().build();
@@ -244,7 +272,7 @@ impl App {
         w.set_type_hint(gdk::WindowTypeHint::Dialog);
         w.set_accept_focus(false);
         w.set_resizable(false);
-        w.set_size_request(400, -1);
+        w.set_size_request(460, -1);
         w.set_opacity(0.0);
         {
             // Keep the card centered on the primary monitor whenever its
@@ -261,16 +289,28 @@ impl App {
             });
         }
 
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        let card = &self.card;
         card.set_widget_name("hiro-card");
-        w.add(&card);
+        w.add(card);
 
         let brand = gtk::Label::new(Some("HIRO"));
         brand.set_widget_name("hiro-brand");
         card.pack_start(&brand, false, false, 0);
 
-        // Content row: animated face + status label.
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        // Body (crossfaded as a unit on result transitions): the status
+        // label on top, then the face with the liveness meters beside it.
+        let body = &self.body;
+        self.status_label.set_widget_name("hiro-label");
+        // Fill the card width so the text block keeps its size whether it
+        // reads "Scanning your face…" or "✓ Verified (97%)"; text centres.
+        self.status_label.set_xalign(0.5);
+        self.status_label.set_halign(gtk::Align::Fill);
+        self.status_label.set_wrap(true);
+        body.pack_start(&self.status_label, false, false, 0);
+
+        // Content row: animated face + side column (meters, hint).
+        let content = &self.content;
+        content.set_halign(gtk::Align::Center);
         self.face.set_size_request(96, 96);
         {
             let face_app = self.rc();
@@ -287,12 +327,7 @@ impl App {
                 glib::Propagation::Proceed
             });
         }
-        self.status_label.set_widget_name("hiro-label");
-        self.status_label.set_xalign(0.0);
-        self.status_label.set_wrap(true);
         content.pack_start(&self.face, false, false, 0);
-        content.pack_start(&self.status_label, true, true, 0);
-        card.pack_start(&content, false, false, 0);
 
         // Liveness meters.
         self.meter_box.pack_start(
@@ -307,21 +342,29 @@ impl App {
             false,
             0,
         );
-        card.pack_start(&self.meter_box, false, false, 0);
 
         self.hint.set_widget_name("hiro-hint");
         self.hint.set_xalign(0.0);
-        card.pack_start(&self.hint, false, false, 0);
+        let side = &self.side;
+        side.pack_start(&self.meter_box, false, false, 0);
+        side.pack_start(&self.hint, false, false, 0);
+        content.pack_start(side, false, false, 0);
+
+        body.pack_start(content, false, false, 0);
+        card.pack_start(body, false, false, 0);
 
         // Approval prompt.
         self.approval_title.set_widget_name("hiro-approval-title");
         self.approval_title.set_wrap(true);
         self.approval_sub.set_widget_name("hiro-approval-sub");
         self.approval_sub.set_wrap(true);
-        self.approval_buttons.set_halign(gtk::Align::Center);
+        self.approval_buttons.set_halign(gtk::Align::Fill);
         self.approval_buttons.set_spacing(8);
         for btn in [&self.allow_btn, &self.deny_btn] {
             btn.style_context().add_class("hiro-approval-btn");
+            // Each button takes exactly half the dialog width, spanning the
+            // full bottom of the card.
+            btn.set_hexpand(true);
         }
         self.allow_btn.style_context().add_class("hiro-allow");
         self.deny_btn.style_context().add_class("hiro-deny");
@@ -364,6 +407,7 @@ impl App {
         cap.set_width_chars(12);
         bar.set_show_text(false);
         bar.set_hexpand(true);
+        bar.set_size_request(190, -1);
         bar.style_context().add_class("hiro-meter");
         bar.style_context().add_class(class);
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -385,7 +429,7 @@ impl App {
         match ev.state.as_str() {
             "approval_pending" => self.show_approval(ev),
             "scanning" => {
-                self.clear_approval();
+                self.clear_approval(true);
                 self.cancel_result_timer();
                 self.pending_result = None;
                 self.cancel_hide_timer();
@@ -401,12 +445,14 @@ impl App {
                 }
             }
             "success" | "failure" => {
-                self.clear_approval();
+                // Keep the approval box visible so the result transition can
+                // fade it out and morph the window smoothly.
+                self.clear_approval(false);
                 self.queue_result(ev);
             }
             _ => {
                 // idle or any unknown state: hide everything.
-                self.clear_approval();
+                self.clear_approval(true);
                 self.cancel_result_timer();
                 self.cancel_hide_timer();
                 self.pending_result = None;
@@ -425,7 +471,7 @@ impl App {
     /// The daemon socket went away; hide any stale UI.
     pub fn on_disconnected(&mut self) {
         log::debug!("daemon unreachable; hiding UI");
-        self.clear_approval();
+        self.clear_approval(true);
         self.cancel_result_timer();
         self.cancel_hide_timer();
         self.pending_result = None;
@@ -444,10 +490,23 @@ impl App {
             FaceState::Scanning
         };
         self.set_accept_focus(false);
+        self.cancel_crossfade(); // a result crossfade must not bleed into the scan
+        self.cancel_approval_fade();
+        self.reset_result_layout();
         self.update_scan_label();
         self.face.queue_draw();
         self.start_animations();
+        // Show the (empty) meter tracks from the first frame so the card's
+        // layout is stable while the bars fill in; enrollment has none.
+        if self.enrolling {
+            self.meter_box.set_visible(false);
+            self.hint.set_visible(false);
+        } else {
+            self.meter_box.set_visible(true);
+            self.hint.set_visible(true);
+        }
         self.show_window();
+        self.animate_to_natural_size();
     }
 
     fn update_scan_label(&mut self) {
@@ -478,14 +537,33 @@ impl App {
             .zip(min_motion)
             .map(|(((v, m), mv), mm)| (v, m, mv, mm))
         else {
-            self.meter_box.set_visible(false);
-            self.hint.set_visible(false);
+            // The meters are shown empty from the first scanning frame
+            // (enter_scanning). Telemetry may lag the scan start by a few
+            // frames; only collapse the tracks once it is clear liveness is
+            // disabled and no data will ever arrive.
+            let past_grace = self
+                .scan_started_at
+                .map(|t| t.elapsed().as_millis() >= LIVENESS_GRACE_MS)
+                .unwrap_or(true);
+            if past_grace {
+                self.meter_box.set_visible(false);
+                self.hint.set_visible(false);
+                self.animate_to_natural_size();
+            }
             return;
         };
         let v_ok = v >= mv;
         let m_ok = m >= mm;
-        self.variance_bar.set_fraction(bar_fraction(v, mv));
-        self.motion_bar.set_fraction(bar_fraction(m, mm));
+        animate_fraction(
+            &self.variance_bar,
+            bar_fraction(v, mv),
+            &mut self.fill_timer_var,
+        );
+        animate_fraction(
+            &self.motion_bar,
+            bar_fraction(m, mm),
+            &mut self.fill_timer_mot,
+        );
         set_meter_class(&self.variance_bar, "hiro-meter-var", v_ok);
         set_meter_class(&self.motion_bar, "hiro-meter-mot", m_ok);
         self.hint.set_text(if v_ok && m_ok {
@@ -493,8 +571,6 @@ impl App {
         } else {
             "Move your head slightly"
         });
-        self.meter_box.set_visible(true);
-        self.hint.set_visible(true);
     }
 
     fn set_enroll_progress(&mut self, accepted: Option<usize>, target: Option<usize>) {
@@ -526,7 +602,12 @@ impl App {
             self.hint_text = Some(hint);
             self.hint_at = Some(now);
         }
+        let became_visible = !self.hint.is_visible();
         self.hint.set_visible(true);
+        // Growing the side column (hint appears) morphs the card size.
+        if became_visible {
+            self.animate_to_natural_size();
+        }
     }
 
     fn start_animations(&mut self) {
@@ -568,10 +649,14 @@ impl App {
     fn show_approval(&mut self, ev: &StateEvent) {
         self.cancel_result_timer();
         self.cancel_hide_timer();
+        self.cancel_crossfade();
+        self.reset_result_layout();
         self.pending_result = None;
         self.stop_animations();
-        self.meter_box.set_visible(false);
-        self.hint.set_visible(false);
+        // Keep the meter tracks in the layout (the card keeps the scan card's
+        // width) but fade them out and glide the smiley to the centre, so the
+        // approval card already has the face position the verified card will
+        // use.
 
         let svc = ev
             .service
@@ -589,6 +674,7 @@ impl App {
             if a.id == id {
                 self.approval.as_mut().unwrap().user_present = ev.user_present != Some(false);
                 self.update_approval_buttons();
+                self.animate_to_natural_size();
                 return;
             }
         }
@@ -618,6 +704,10 @@ impl App {
         self.update_approval_buttons();
         self.start_approval_timer();
         self.show_window();
+        // Fade the meters/hint out in place and glide the smiley to the
+        // centre, then grow the card to include the prompt.
+        self.settle_side_and_center_face();
+        self.animate_to_natural_size();
     }
 
     fn update_approval_buttons(&mut self) {
@@ -708,10 +798,15 @@ impl App {
         });
     }
 
-    fn clear_approval(&mut self) {
+    fn clear_approval(&mut self, hide_box: bool) {
         self.stop_approval_timer();
+        self.cancel_approval_fade();
         self.approval = None;
-        self.approval_box.set_visible(false);
+        // When hide_box is false the box is left visible so the result
+        // transition can fade it out smoothly.
+        if hide_box {
+            self.approval_box.set_visible(false);
+        }
         self.approval_buttons.set_visible(false);
         self.set_accept_focus(false);
     }
@@ -728,10 +823,13 @@ impl App {
         };
         if is_immediate_failure(&result.state, result.reason.as_deref()) {
             // Rate-limited / locked-out / password-required: rejected before
-            // any scan, so show the verdict immediately.
+            // any scan, so show the verdict immediately as a compact card
+            // (no meter tracks).
             self.cancel_result_timer();
             self.cancel_hide_timer();
             self.stop_animations();
+            self.meter_box.set_visible(false);
+            self.hint.set_visible(false);
             self.state = result.state.clone();
             self.pending_result = Some(result);
             self.present_result();
@@ -758,7 +856,12 @@ impl App {
             move || {
                 let mut app = rc.borrow_mut();
                 app.result_timer = None;
-                if app.state != "scanning" || app.pending_result.is_none() {
+                // The result may arrive while an approval prompt is up
+                // (Allow/Deny clicked, or the decision window expired); both
+                // 'scanning' and 'approval_pending' are valid pre-result states.
+                if (app.state != "scanning" && app.state != "approval_pending")
+                    || app.pending_result.is_none()
+                {
                     return ControlFlow::Break;
                 }
                 app.present_result();
@@ -773,16 +876,25 @@ impl App {
         };
         self.state = r.state.clone();
         self.stop_animations();
-        self.meter_box.set_visible(false);
-        self.hint.set_visible(false);
+        // The meters/hint stay visible here; the in-place result transition
+        // fades them out (and a compact verdict never showed them).
         let warn = is_immediate_failure(&r.state, r.reason.as_deref());
         let text = if r.state == "success" {
             if self.enrolling {
                 let n = r.accepted.unwrap_or(0);
-                format!(
-                    "✓ {n} face template{} enrolled",
-                    if n == 1 { "" } else { "s" }
-                )
+                let plural = if n == 1 { "" } else { "s" };
+                if r.reason.as_deref() == Some("insufficient_templates") {
+                    // The run succeeded but the user still sits below the
+                    // minimum distinct-pose count: keep the success frame
+                    // and nudge them to run enrollment again.
+                    let missing = r.target.unwrap_or(n).saturating_sub(n);
+                    format!(
+                        "✓ {n} face template{plural} enrolled — {missing} more pose{} needed",
+                        if missing == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!("✓ {n} face template{plural} enrolled")
+                }
             } else {
                 let score = r
                     .score
@@ -799,16 +911,29 @@ impl App {
                 }
             })
         };
-        self.status_label.set_text(&text);
-        self.face_state = if r.state == "success" {
+        let face_state = if r.state == "success" {
             FaceState::Success
         } else if warn {
             FaceState::Warn
         } else {
             FaceState::Fail
         };
-        self.face.queue_draw();
         self.show_window();
+        // If an approval prompt was up, fade it out and let the window
+        // settle to the result size instead of snapping.
+        if self.approval_box.is_visible() {
+            self.fade_out_approval_box();
+        }
+        // A scan that was showing its meter tracks morphs in place: the card
+        // keeps its width, the bars fade out and the smiley glides to the
+        // centre while turning the result colour. A compact verdict (no scan
+        // happened) just crossfades and shrinks to fit.
+        if self.meter_box.is_visible() {
+            self.transition_to_result(text, face_state);
+        } else {
+            self.crossfade_result(text, face_state);
+            self.animate_to_natural_size();
+        }
         self.schedule_hide(RESULT_MS);
     }
 
@@ -875,6 +1000,10 @@ impl App {
 
     fn hide_window(&mut self) {
         self.cancel_fade();
+        self.cancel_resize_animation();
+        self.cancel_crossfade();
+        self.cancel_approval_fade();
+        self.reset_result_layout();
         if !self.window.is_visible() {
             return;
         }
@@ -902,6 +1031,254 @@ impl App {
             id.remove();
         }
     }
+
+    // --- Smooth resize and content transitions ---
+
+    /// Ease the window from its current size to the card's natural size so
+    /// it grows/shrinks smoothly when content appears or disappears. The
+    /// size-allocate hook re-centres on the primary monitor at every step,
+    /// so the growth stays symmetric. Interruptible: a newer request
+    /// cancels the in-flight animation and restarts from the current size.
+    fn animate_to_natural_size(&mut self) {
+        self.cancel_resize_animation();
+        let (_, natural) = self.card.preferred_size();
+        let target_w = natural.width.max(460);
+        let target_h = natural.height;
+        let (cur_w, cur_h) = self.window.size();
+        if (cur_w - target_w).abs() < 2 && (cur_h - target_h).abs() < 2 {
+            return;
+        }
+        // Re-assert the current size so GTK's own resize-on-request-change
+        // (triggered by the size-request change) cannot snap the window to
+        // the target before the easing below takes over.
+        self.window.resize(cur_w, cur_h);
+        let rc = self.rc();
+        let start = Instant::now();
+        self.resize_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(RESIZE_STEP_MS),
+            move || {
+                let mut app = rc.borrow_mut();
+                let t = (start.elapsed().as_secs_f64() / (RESIZE_MS as f64 / 1000.0)).min(1.0);
+                let e = ease_out_quad(t);
+                let w = (cur_w as f64 + (target_w - cur_w) as f64 * e).round() as i32;
+                let h = (cur_h as f64 + (target_h - cur_h) as f64 * e).round() as i32;
+                app.window.resize(w, h);
+                if t >= 1.0 {
+                    app.resize_timer = None;
+                    return ControlFlow::Break;
+                }
+                ControlFlow::Continue
+            },
+        ));
+    }
+
+    fn cancel_resize_animation(&mut self) {
+        if let Some(id) = self.resize_timer.take() {
+            id.remove();
+        }
+    }
+
+    /// Crossfade the card body to a result: fade the old content out, swap
+    /// in the verdict text/face, fade back in. Matches the extension's
+    /// `_transitionToResult`; the window shrink happens in parallel via
+    /// `animate_to_natural_size`.
+    fn crossfade_result(&mut self, text: String, face_state: FaceState) {
+        self.cancel_crossfade();
+        // Compact verdicts (no scan / no meters): start from a clean layout.
+        self.reset_result_layout();
+        let rc = self.rc();
+        let phase = Rc::new(RefCell::new(0u8));
+        let phase_start = Rc::new(RefCell::new(Instant::now()));
+        self.crossfade_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(FADE_STEP_MS),
+            move || {
+                let mut app = rc.borrow_mut();
+                let mut phase = phase.borrow_mut();
+                let mut phase_start = phase_start.borrow_mut();
+                if *phase == 0 {
+                    // Fade the old content out, then swap in the result.
+                    let t = phase_start.elapsed().as_secs_f64()
+                        / (FADE_OUT_MS as f64 / 1000.0);
+                    if t < 1.0 {
+                        app.body.set_opacity(1.0 - t);
+                        return ControlFlow::Continue;
+                    }
+                    app.body.set_opacity(0.0);
+                    app.status_label.set_text(&text);
+                    app.face_state = face_state;
+                    app.face.queue_draw();
+                    // The verdict text is narrower than the scan label, so
+                    // re-ease to the final natural size after the swap.
+                    app.animate_to_natural_size();
+                    *phase = 1;
+                    *phase_start = Instant::now();
+                    ControlFlow::Continue
+                } else {
+                    // Fade the result in.
+                    let t = phase_start.elapsed().as_secs_f64()
+                        / (FADE_IN_MS as f64 / 1000.0);
+                    if t < 1.0 {
+                        app.body.set_opacity(t);
+                        return ControlFlow::Continue;
+                    }
+                    app.body.set_opacity(1.0);
+                    app.crossfade_timer = None;
+                    ControlFlow::Break
+                }
+            },
+        ));
+    }
+
+    fn cancel_crossfade(&mut self) {
+        if let Some(id) = self.crossfade_timer.take() {
+            id.remove();
+        }
+        self.body.set_opacity(1.0);
+    }
+
+    /// Undo everything the in-place result transition did (frozen row width,
+    /// shifted smiley, transparent meters) so the next state starts clean.
+    /// Called at state boundaries, not by cancel_crossfade — the approval →
+    /// result flow must keep the face position the approval already set.
+    fn reset_result_layout(&mut self) {
+        self.body.set_opacity(1.0);
+        self.content.set_size_request(-1, -1);
+        self.face.set_margin_start(0);
+        self.side.set_opacity(1.0);
+    }
+
+    /// Freeze the content-row width (the card keeps the scan card's width),
+    /// fade the meters/hint out in place, and glide the smiley to the centre.
+    /// Shared by the approval and result transitions so the face ends up in
+    /// the same place.
+    fn settle_side_and_center_face(&mut self) {
+        self.cancel_crossfade();
+        let (_, nat) = self.content.preferred_size();
+        let row_w = nat.width.max(96);
+        self.content.set_size_request(row_w, -1);
+        let dx = ((row_w as f64 - 96.0) / 2.0).round() as i32;
+        let face = self.face.clone();
+        let side = self.side.clone();
+        let start = Instant::now();
+        self.crossfade_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(FADE_STEP_MS),
+            move || {
+                let t = start.elapsed().as_secs_f64() / 0.28;
+                let e = ease_in_out_quad(t.min(1.0));
+                face.set_margin_start((dx as f64 * e).round() as i32);
+                side.set_opacity(1.0 - e);
+                if t >= 1.0 {
+                    face.set_margin_start(dx);
+                    side.set_opacity(0.0);
+                    return ControlFlow::Break;
+                }
+                ControlFlow::Continue
+            },
+        ));
+    }
+
+    /// Fade an up-standing approval prompt out (result arrived), then hide it
+    /// and let the window settle to the result size.
+    fn fade_out_approval_box(&mut self) {
+        if !self.approval_box.is_visible() {
+            return;
+        }
+        self.cancel_approval_fade();
+        let rc = self.rc();
+        let start = Instant::now();
+        let duration = FADE_OUT_MS as f64 / 1000.0;
+        self.approval_fade_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(FADE_STEP_MS),
+            move || {
+                let mut app = rc.borrow_mut();
+                let t = start.elapsed().as_secs_f64() / duration;
+                if t >= 1.0 {
+                    app.approval_box.set_opacity(1.0);
+                    app.approval_box.set_visible(false);
+                    app.approval_fade_timer = None;
+                    // The box is out of the layout now: settle the window.
+                    app.animate_to_natural_size();
+                    return ControlFlow::Break;
+                }
+                app.approval_box.set_opacity(1.0 - t);
+                ControlFlow::Continue
+            },
+        ));
+    }
+
+    fn cancel_approval_fade(&mut self) {
+        if let Some(id) = self.approval_fade_timer.take() {
+            id.remove();
+        }
+        self.approval_box.set_opacity(1.0);
+    }
+
+    /// In-place morph of the scanning card to the verdict: the card keeps
+    /// its width (the meter rows stay in the layout and fade out), the label
+    /// crossfades to the result text, and the smiley glides to the centre
+    /// while the face_state swap (result colour) happens under a fade.
+    fn transition_to_result(&mut self, text: String, face_state: FaceState) {
+        self.cancel_crossfade();
+        // Freeze the content-row width so the result card keeps the scan
+        // card's dimensions while the meters fade and the smiley slides.
+        let (_, nat) = self.content.preferred_size();
+        let row_w = nat.width.max(96);
+        self.content.set_size_request(row_w, -1);
+        let dx = ((row_w as f64 - 96.0) / 2.0).round() as i32;
+
+        let rc = self.rc();
+        let phase = Rc::new(RefCell::new(0u8));
+        let phase_start = Rc::new(RefCell::new(Instant::now()));
+        let start = Rc::new(RefCell::new(Instant::now()));
+        let face = self.face.clone();
+        // Start the glide from the smiley's current margin (for an approval
+        // result it is already centred, so the glide is a no-op).
+        let from_margin = self.face.margin_start();
+        self.crossfade_timer = Some(glib::timeout_add_local(
+            Duration::from_millis(FADE_STEP_MS),
+            move || {
+                let mut app = rc.borrow_mut();
+                let mut phase = phase.borrow_mut();
+                let mut phase_start = phase_start.borrow_mut();
+                let start = start.borrow_mut();
+                // The slide runs continuously from the start (280 ms), so the
+                // smiley is still gliding while it fades back in.
+                let tween_t = (start.elapsed().as_secs_f64() / 0.28).min(1.0);
+                let m = (from_margin as f64 + (dx - from_margin) as f64
+                    * ease_in_out_quad(tween_t)).round() as i32;
+                face.set_margin_start(m);
+                if *phase == 0 {
+                    // Fade the old content out (label + face + meters).
+                    let t = phase_start.elapsed().as_secs_f64()
+                        / (FADE_OUT_MS as f64 / 1000.0);
+                    if t < 1.0 {
+                        app.body.set_opacity(1.0 - t);
+                        return ControlFlow::Continue;
+                    }
+                    // Swap in the verdict; the meters are gone for good.
+                    app.body.set_opacity(0.0);
+                    app.status_label.set_text(&text);
+                    app.face_state = face_state;
+                    app.face.queue_draw();
+                    app.side.set_opacity(0.0);
+                    *phase = 1;
+                    *phase_start = Instant::now();
+                    ControlFlow::Continue
+                } else {
+                    // Fade the verdict back in.
+                    let t = phase_start.elapsed().as_secs_f64()
+                        / (FADE_IN_MS as f64 / 1000.0);
+                    if t < 1.0 {
+                        app.body.set_opacity(t);
+                        return ControlFlow::Continue;
+                    }
+                    app.body.set_opacity(1.0);
+                    app.crossfade_timer = None;
+                    ControlFlow::Break
+                }
+            },
+        ));
+    }
 }
 
 fn bar_fraction(value: f32, max: f32) -> f64 {
@@ -909,6 +1286,49 @@ fn bar_fraction(value: f32, max: f32) -> f64 {
         return 0.0;
     }
     (value / max).clamp(0.0, 1.0) as f64
+}
+
+/// Ease-out-quad easing, the same shape as Clutter's `EASE_OUT_QUAD` used
+/// by the GNOME extension's size morphs.
+fn ease_out_quad(t: f64) -> f64 {
+    t * (2.0 - t)
+}
+
+/// Ease-in-out-quad easing, the same shape as Clutter's `EASE_IN_OUT_QUAD`
+/// used by the extension's smiley glide.
+fn ease_in_out_quad(t: f64) -> f64 {
+    if t < 0.5 {
+        2.0 * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(2) / 2.0
+    }
+}
+
+/// Ease a progress bar toward `target` instead of snapping, so the bars
+/// grow smoothly as telemetry streams in. A newer tick cancels the in-flight
+/// tween and retargets from the current value.
+fn animate_fraction(bar: &gtk::ProgressBar, target: f64, timer: &mut Option<glib::SourceId>) {
+    if let Some(id) = timer.take() {
+        id.remove();
+    }
+    let from = bar.fraction();
+    if (from - target).abs() < 0.001 {
+        return;
+    }
+    let bar = bar.clone();
+    let start = Instant::now();
+    *timer = Some(glib::timeout_add_local(
+        Duration::from_millis(FILL_STEP_MS),
+        move || {
+            let t = start.elapsed().as_secs_f64() / (FILL_MS as f64 / 1000.0);
+            if t >= 1.0 {
+                bar.set_fraction(target);
+                return ControlFlow::Break;
+            }
+            bar.set_fraction(from + (target - from) * ease_out_quad(t));
+            ControlFlow::Continue
+        },
+    ));
 }
 
 fn set_meter_class(bar: &gtk::ProgressBar, base: &str, ok: bool) {
@@ -942,6 +1362,53 @@ mod tests {
         for (remaining_ms, expected) in [(5_000u64, 5u64), (5_001, 6), (1, 1), (999, 1), (1_000, 1)]
         {
             assert_eq!(remaining_ms.div_ceil(1000), expected, "{remaining_ms}ms");
+        }
+    }
+
+    #[test]
+    fn ease_out_quad_endpoints_and_monotonicity() {
+        // Eases from 0 to 1, is monotonic, and starts fast then slows.
+        assert_eq!(ease_out_quad(0.0), 0.0);
+        assert_eq!(ease_out_quad(1.0), 1.0);
+        let mut prev = f64::MIN;
+        for i in 0..=100 {
+            let t = i as f64 / 100.0;
+            let e = ease_out_quad(t);
+            assert!(e >= prev, "non-monotonic at t={t}");
+            assert!((0.0..=1.0).contains(&e));
+            prev = e;
+        }
+        // Starts decelerating: the midpoint has already covered 3/4.
+        assert_eq!(ease_out_quad(0.5), 0.75);
+    }
+
+    #[test]
+    fn resize_steps_reach_target() {
+        // The stepped resize math used by animate_to_natural_size lands on
+        // the target after the easing completes.
+        let (cur_w, cur_h, target_w, target_h) = (400, 200, 470, 330);
+        let mut last = (cur_w, cur_h);
+        for i in 0..=64 {
+            let t = ((i as f64) * RESIZE_STEP_MS as f64 / 1000.0) / (RESIZE_MS as f64 / 1000.0);
+            let t = t.min(1.0);
+            let e = ease_out_quad(t);
+            last = (
+                (cur_w as f64 + (target_w - cur_w) as f64 * e).round() as i32,
+                (cur_h as f64 + (target_h - cur_h) as f64 * e).round() as i32,
+            );
+        }
+        assert_eq!(last, (target_w, target_h));
+        // And intermediate steps move monotonically toward the target.
+        let mut prev = (cur_w, cur_h);
+        for i in 0..=20 {
+            let t = ((i as f64) * RESIZE_STEP_MS as f64 / 1000.0) / (RESIZE_MS as f64 / 1000.0);
+            let e = ease_out_quad(t.min(1.0));
+            let step = (
+                (cur_w as f64 + (target_w - cur_w) as f64 * e).round() as i32,
+                (cur_h as f64 + (target_h - cur_h) as f64 * e).round() as i32,
+            );
+            assert!(step.0 >= prev.0 && step.1 >= prev.1, "stepped backwards at i={i}");
+            prev = step;
         }
     }
 }

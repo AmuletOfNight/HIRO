@@ -69,6 +69,22 @@ auto_threshold_min = 0.50
 auto_threshold_max = 0.90
 # EMA rate per successful match (0.0 disables adaptive tracking).
 auto_threshold_adapt = 0.02
+# Minimum number of DISTINCT templates (poses) a user should have enrolled.
+# Enrollment stores whatever it captured and warns while the user sits
+# below this, so a re-run adds more poses (progress is kept). 0 disables
+# the minimum. Verification still works with fewer templates.
+enroll_min_templates = 3
+# Adaptive template refinement: after a GRANTED, confident match, blend the
+# live matched embedding into the template that matched it, so the template
+# slowly follows your appearance (haircut, glasses, aging) without
+# re-enrolling. Only ever happens on granted matches, never on failures.
+template_refine_enabled = true
+# EMA rate per refinement (0.0 disables refinement).
+template_refine_rate = 0.10
+# The match score must sit at least this far above the threshold used
+# before the sample may refine the template (marginal matches must not
+# drag the template toward an impostor).
+template_refine_min_margin = 0.05
 
 [security]
 rate_limit_attempts = 5

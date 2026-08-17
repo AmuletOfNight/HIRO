@@ -45,6 +45,9 @@ pub fn reason_label(reason: Option<&str>) -> Option<String> {
     if r.contains("no_luma") {
         return Some("Camera frames unreadable".into());
     }
+    if r.contains("insufficient_templates") {
+        return Some("More poses needed — run `hiro enroll` again".into());
+    }
     if r.contains("no_templates") || r.contains("no template") {
         return Some("No face enrolled yet".into());
     }
@@ -136,6 +139,10 @@ mod tests {
         assert_eq!(
             reason_label(Some("liveness_failed")).as_deref(),
             Some("Not enough movement — try again and move your head slightly")
+        );
+        assert_eq!(
+            reason_label(Some("insufficient_templates")).as_deref(),
+            Some("More poses needed — run `hiro enroll` again")
         );
     }
 

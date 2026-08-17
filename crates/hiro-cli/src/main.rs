@@ -130,6 +130,13 @@ fn main() {
                         println!("Calibrated per-user match threshold: {t:.3}");
                     }
                     if r.added > 0 {
+                        if !r.min_templates_met {
+                            println!(
+                                "Warning: {}/{} distinct poses enrolled - run `hiro enroll` again \
+                                 and turn your head between captures for reliable matching.",
+                                r.total_templates, r.min_templates_required
+                            );
+                        }
                         println!("Tip: verify with `hiro test`, then enable PAM integration.");
                     } else {
                         println!("No templates added - check lighting, face the camera, and run `hiro doctor`.");
@@ -147,13 +154,18 @@ fn main() {
                     if templates.is_empty() {
                         println!("no templates enrolled");
                     } else {
-                        println!("id        created   quality");
+                        println!("id        created   refined   quality");
                         for t in templates {
                             let when = chrono_like(t.created_at);
+                            let refined = t
+                                .refined_at
+                                .map(chrono_like)
+                                .unwrap_or_else(|| "-".into());
                             println!(
-                                "{:<9} {:<9} {}",
+                                "{:<9} {:<9} {:<9} {}",
                                 t.id,
                                 when,
+                                refined,
                                 t.quality
                                     .map(|q| format!("{q:.1}"))
                                     .unwrap_or_else(|| "-".into())

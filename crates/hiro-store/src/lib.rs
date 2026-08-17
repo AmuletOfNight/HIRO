@@ -40,6 +40,8 @@ pub struct TemplateRecord {
     pub ciphertext: Vec<u8>,
     pub quality: Option<f32>,
     pub created_at: i64,
+    /// Last refinement timestamp (`None` when never refined).
+    pub refined_at: Option<i64>,
 }
 
 pub struct Store {
@@ -96,7 +98,8 @@ impl Store {
                 dim        INTEGER NOT NULL,
                 ciphertext BLOB NOT NULL,
                 quality    REAL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                refined_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -154,6 +157,20 @@ impl Store {
         if !cols.iter().any(|c| c == "camera_secret") {
             self.conn
                 .execute_batch("ALTER TABLE users ADD COLUMN camera_secret BLOB")
+                .map_err(StoreError::Db)?;
+        }
+        let mut tstmt = self
+            .conn
+            .prepare("PRAGMA table_info(templates)")
+            .map_err(StoreError::Db)?;
+        let tcols: Vec<String> = tstmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(StoreError::Db)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::Db)?;
+        if !tcols.iter().any(|c| c == "refined_at") {
+            self.conn
+                .execute_batch("ALTER TABLE templates ADD COLUMN refined_at INTEGER")
                 .map_err(StoreError::Db)?;
         }
         Ok(())
@@ -222,7 +239,7 @@ impl Store {
 
     pub fn list_templates(&self, user_name: &str) -> Result<Vec<TemplateRecord>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, user_name, model, dim, ciphertext, quality, created_at
+            r#"SELECT id, user_name, model, dim, ciphertext, quality, created_at, refined_at
                FROM templates WHERE user_name = ?1 ORDER BY id"#,
         )?;
         let rows = stmt.query_map(params![user_name], |row| {
@@ -234,9 +251,23 @@ impl Store {
                 ciphertext: row.get(4)?,
                 quality: row.get(5)?,
                 created_at: row.get(6)?,
+                refined_at: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Replace a template's ciphertext (adaptive template refinement) and
+    /// stamp `refined_at`. The ciphertext must already be sealed for
+    /// `user_name`. Returns `false` when the template no longer exists
+    /// (e.g. removed mid-request).
+    pub fn update_template(&self, user_name: &str, id: i64, ciphertext: &[u8]) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE templates SET ciphertext = ?3, refined_at = unixepoch()
+             WHERE id = ?1 AND user_name = ?2",
+            params![id, user_name, ciphertext],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn remove_template(&self, user_name: &str, id: i64) -> Result<bool> {
@@ -600,6 +631,38 @@ mod tests {
         s.upsert_user("alice", None).unwrap();
         s.set_login_secret("alice", Some(b"ct".as_slice())).unwrap();
         assert_eq!(s.login_secret("alice").unwrap().unwrap(), b"ct");
+
+        // The refined_at column migration must land on legacy schemas too.
+        let id = s.add_template("alice", "m", 4, b"old", None).unwrap();
+        assert!(s.list_templates("alice").unwrap()[0].refined_at.is_none());
+        assert!(s.update_template("alice", id, b"new").unwrap());
+        let row = &s.list_templates("alice").unwrap()[0];
+        assert_eq!(row.ciphertext, b"new");
+        assert!(row.refined_at.is_some());
+    }
+
+    #[test]
+    fn update_template_stamps_refined_at() {
+        let s = store();
+        s.upsert_user("alice", Some(1000)).unwrap();
+        let id = s
+            .add_template("alice", "auraface", 512, b"cipher-bytes", Some(0.9))
+            .unwrap();
+        assert!(
+            s.list_templates("alice").unwrap()[0].refined_at.is_none(),
+            "a fresh template is never refined"
+        );
+
+        assert!(s.update_template("alice", id, b"refined").unwrap());
+        let row = &s.list_templates("alice").unwrap()[0];
+        assert_eq!(row.ciphertext, b"refined");
+        assert!(row.refined_at.is_some(), "refinement stamps refined_at");
+
+        // Wrong id or wrong user: no-op, and the stored blob is untouched.
+        assert!(!s.update_template("alice", id + 1, b"x").unwrap());
+        s.upsert_user("bob", None).unwrap();
+        assert!(!s.update_template("bob", id, b"x").unwrap());
+        assert_eq!(s.list_templates("alice").unwrap()[0].ciphertext, b"refined");
     }
 
     #[test]
