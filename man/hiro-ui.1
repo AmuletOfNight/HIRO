@@ -7,8 +7,8 @@ hiro-ui \- desktop-agnostic status indicator and approval prompt for HIRO
 .SH DESCRIPTION
 HIRO ("Hello, InfraRed, On Linux") provides Windows Hello-style face
 authentication on Linux using the built-in IR camera. \fBhiro-ui\fR is the
-desktop-agnostic session UI: a small, frameless, always-on-top card pinned
-near the top of the primary monitor that shows scanning progress and
+desktop-agnostic session UI: a small, frameless, always-on-top card centered
+on the primary monitor that shows scanning progress and
 liveness meters while your face is authenticated, Allow/Deny prompts when a
 non-login request (sudo, polkit, lock screen, ...) needs an explicit
 decision, and a result flash with the verdict.
@@ -16,10 +16,12 @@ decision, and a result flash with the verdict.
 It is a per-user, per-session process started by the systemd user service
 \fBhiro-ui.service\fR (or the XDG autostart entry), and it consumes the same
 state stream as the GNOME Shell extension \fBhiro-status@hiro\fR. It renders
-nothing on GNOME sessions where that extension is enabled (the extension owns
-the UI there); see the \fI[ui]\fR section of \fBhiro.conf\fR(5) to override
-detection. On the lock screen or login greeter an in-session overlay cannot
-be shown; those requests fall back to your password.
+nothing while that extension reports enabled (the extension owns the UI
+there; detection probes the running shell over D-Bus, so it does not depend
+on desktop environment variables); see the \fI[ui]\fR section of
+\fBhiro.conf\fR(5) to override detection. On the lock screen or login
+greeter an in-session overlay cannot be shown; those requests fall back to
+your password.
 .PP
 The daemon must be running for the UI to display anything. The card hides
 while the daemon is unreachable and reappears on reconnect.

@@ -22,7 +22,15 @@ pub fn decide(mode: UiMode) -> UiDecision {
         UiMode::Off => UiDecision::Disabled,
         UiMode::On => UiDecision::Active,
         UiMode::Auto => {
-            if ui::desktop_is_gnome() && ui::gnome_extension_enabled() {
+            // `gnome-extensions info` reports the extension's state against
+            // the *running* shell: an `ENABLED` answer is only possible when
+            // GNOME Shell is up with the extension active, so it alone
+            // decides the deferral. Desktop-environment hints
+            // (XDG_CURRENT_DESKTOP & friends) are deliberately NOT consulted
+            // here: systemd user units and XDG-autostart launches rarely
+            // inherit them, which used to make hiro-ui render on top of the
+            // extension in GNOME sessions.
+            if ui::gnome_extension_enabled() {
                 UiDecision::Defer
             } else {
                 UiDecision::Active

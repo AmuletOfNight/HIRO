@@ -1,13 +1,45 @@
-//! Cairo-drawn "face" glyph for the status card.
+//! Cairo-drawn status glyph for the status card.
 //!
-//! A faithful port of the GNOME Shell extension's `_drawFace`: ring, eyes,
-//! mouth, and (while scanning) corner brackets plus a sweeping highlight
-//! line. `sweep` sweeps 0.0..=1.0 once per animation period; `breathe`
-//! scales the whole glyph slightly so it feels alive.
+//! Renders the full HIRO logo (`Logo/HIRO.svg`'s raster export, shipped as
+//! `assets/hiro-logo.png`) as the status glyph, with only the logo's own
+//! strokes drawn — the background stays transparent. The logo's stroke is a
+//! neutral slate, so it is pre-tinted with the status accent exactly like the
+//! old ring/eyes/mouth drawing (amber while scanning, green on success, red
+//! on failure, ...). While scanning, corner brackets plus a sweeping
+//! highlight line animate across it. `sweep` sweeps 0.0..=1.0 once per
+//! animation period; `breathe` scales the whole glyph slightly so it feels
+//! alive.
+//!
+//! If the embedded logo cannot be decoded (gdk-pixbuf unavailable), the
+//! drawing falls back to the hand-drawn ring/eyes/mouth glyph.
 
+use std::cell::RefCell;
 use std::f64::consts::PI;
 
 use gtk::cairo::{Context, LineCap};
+use gtk::gdk::prelude::GdkContextExt;
+use gtk::gdk_pixbuf::{InterpType, Pixbuf};
+
+/// The full HIRO logo, byte-for-byte as shipped in `Logo/HIRO.png`. RGBA,
+/// 1045×1185; the logo's stroke is a neutral slate so it takes whatever
+/// accent colour the current status needs.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/hiro-logo.png");
+
+/// Display height (px) of the pre-scaled copy used at draw time. The logo is
+/// shown at ~60 px in the 64-grid, so a 240 px copy keeps it crisp up to 4×
+/// HiDPI while keeping the per-frame draw cost low.
+const LOGO_TARGET_H: i32 = 240;
+
+thread_local! {
+    /// Lazily decoded and pre-scaled base logo. The GTK draw path only ever
+    /// runs on the main thread, so a `thread_local` avoids any Send/Sync
+    /// questions around `Pixbuf` and means a decode failure is a graceful
+    /// one-time miss.
+    static LOGO: RefCell<Option<Pixbuf>> = const { RefCell::new(None) };
+    /// Per-state pre-tinted copies (accent applied at load time), so the
+    /// draw path never relies on Cairo operator tricks.
+    static TINTED: RefCell<Vec<(FaceState, Pixbuf)>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Facial expression states, one per UI status colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +68,21 @@ impl FaceState {
     }
 }
 
+/// Geometry of the scan bracket frame and the sweeping highlight, in the
+/// Cairo context's user space (already scaled from the 64×64 design grid).
+struct ScanFrame {
+    /// Bracket frame (L-corners) bounds.
+    fx: f64,
+    fy: f64,
+    fw: f64,
+    fh: f64,
+    /// Sweeping highlight band: x origin, width, and vertical sweep range.
+    sweep_x: f64,
+    sweep_w: f64,
+    sweep_a: f64,
+    sweep_b: f64,
+}
+
 /// Paint the face glyph centred in a surface of the given size.
 ///
 /// Cairo operations return `Result`s that are irrelevant here (a failure to
@@ -57,11 +104,111 @@ pub fn draw_face(cr: &Context, w: f64, h: f64, state: FaceState, sweep: f64, bre
 
     let set = |alpha: f64| cr.set_source_rgba(r, g, b, alpha);
 
-    // Outer glow, ring, and face plate.
-    set(0.10);
-    cr.arc(cx, cy, 26.0 * scale, 0.0, 2.0 * PI);
-    cr.fill();
+    let frame = match logo_pixbuf(state) {
+        Some(pb) => {
+            // The logo is portrait (smiley over the HIRO wordmark), so fit it
+            // to the 60-tall scan zone (2..62 of the 64-grid), centred. Only
+            // the logo's own strokes are drawn — the background stays
+            // transparent so the card colour shows through.
+            let aspect = pb.width() as f64 / pb.height() as f64;
+            let th = 60.0 * scale;
+            let tw = th * aspect;
+            let dx = cx - tw / 2.0;
+            let dy = cy - th / 2.0;
 
+            cr.save();
+            cr.translate(dx, dy);
+            cr.scale(tw / pb.width() as f64, th / pb.height() as f64);
+            cr.set_source_pixbuf(&pb, 0.0, 0.0);
+            cr.paint();
+            cr.restore();
+
+            ScanFrame {
+                fx: dx - 1.5 * scale,
+                fy: dy - 1.5 * scale,
+                fw: tw + 3.0 * scale,
+                fh: th + 3.0 * scale,
+                sweep_x: dx + 2.0 * scale,
+                sweep_w: tw - 4.0 * scale,
+                sweep_a: dy + 2.0 * scale,
+                sweep_b: dy + th - 2.0 * scale,
+            }
+        }
+        None => {
+            // Fallback: the legacy hand-drawn smiley glyph.
+            draw_legacy_face(cr, scale, cx, cy, state, &set);
+            ScanFrame {
+                fx: 6.0 * scale,
+                fy: 6.0 * scale,
+                fw: 52.0 * scale,
+                fh: 52.0 * scale,
+                sweep_x: 13.0 * scale,
+                sweep_w: 38.0 * scale,
+                sweep_a: 23.0 * scale,
+                sweep_b: 41.0 * scale,
+            }
+        }
+    };
+
+    // Scan brackets and the sweeping highlight while scanning.
+    if scanning {
+        let arm = 8.0 * scale;
+        cr.set_line_width(2.0 * scale);
+        set(1.0);
+        cr.new_sub_path();
+        cr.move_to(frame.fx, frame.fy + arm);
+        cr.line_to(frame.fx, frame.fy);
+        cr.line_to(frame.fx + arm, frame.fy);
+        cr.move_to(frame.fx + frame.fw - arm, frame.fy);
+        cr.line_to(frame.fx + frame.fw, frame.fy);
+        cr.line_to(frame.fx + frame.fw, frame.fy + arm);
+        cr.move_to(frame.fx, frame.fy + frame.fh - arm);
+        cr.line_to(frame.fx, frame.fy + frame.fh);
+        cr.line_to(frame.fx + arm, frame.fy + frame.fh);
+        cr.move_to(frame.fx + frame.fw - arm, frame.fy + frame.fh);
+        cr.line_to(frame.fx + frame.fw, frame.fy + frame.fh);
+        cr.line_to(frame.fx + frame.fw, frame.fy + frame.fh - arm);
+        cr.stroke();
+
+        let sweep_y = frame.sweep_a + sweep * (frame.sweep_b - frame.sweep_a);
+        set(0.16);
+        round_rect(
+            cr,
+            frame.sweep_x,
+            sweep_y - 5.0 * scale,
+            frame.sweep_w,
+            10.0 * scale,
+            5.0 * scale,
+        );
+        cr.fill();
+        set(1.0);
+        round_rect(
+            cr,
+            frame.sweep_x,
+            sweep_y - 1.0 * scale,
+            frame.sweep_w,
+            2.5 * scale,
+            1.5 * scale,
+        );
+        cr.fill();
+    }
+
+    cr.restore();
+}
+
+/// The pre-logo hand-drawn glyph, used only if the embedded logo cannot be
+/// decoded. Kept deliberately simple so a gdk-pixbuf failure degrades
+/// gracefully instead of leaving the card's face blank.
+#[allow(unused_must_use)]
+fn draw_legacy_face(
+    cr: &Context,
+    scale: f64,
+    cx: f64,
+    cy: f64,
+    state: FaceState,
+    set: &impl Fn(f64),
+) {
+    // Ring and face plate.
     set(0.92);
     cr.set_line_width(1.6 * scale);
     cr.set_line_cap(LineCap::Round);
@@ -101,50 +248,67 @@ pub fn draw_face(cr: &Context, w: f64, h: f64, state: FaceState, sweep: f64, bre
         cr.arc(cx, 37.5 * scale, 9.0 * scale, PI * 0.15, PI * 0.85);
     }
     cr.stroke();
+}
 
-    // Scan brackets and the sweeping highlight while scanning.
-    if scanning {
-        cr.set_line_width(2.0 * scale);
-        set(1.0);
-        cr.new_sub_path();
-        cr.move_to(6.0 * scale, 14.0 * scale);
-        cr.line_to(6.0 * scale, 6.0 * scale);
-        cr.line_to(14.0 * scale, 6.0 * scale);
-        cr.move_to(50.0 * scale, 6.0 * scale);
-        cr.line_to(58.0 * scale, 6.0 * scale);
-        cr.line_to(58.0 * scale, 14.0 * scale);
-        cr.move_to(6.0 * scale, 50.0 * scale);
-        cr.line_to(6.0 * scale, 58.0 * scale);
-        cr.line_to(14.0 * scale, 58.0 * scale);
-        cr.move_to(50.0 * scale, 58.0 * scale);
-        cr.line_to(58.0 * scale, 58.0 * scale);
-        cr.line_to(58.0 * scale, 50.0 * scale);
-        cr.stroke();
+/// The status-tinted logo for `state`, cached per state. `None` on any
+/// failure (missing gdk-pixbuf loader, corrupt asset, ...); callers fall back
+/// to the legacy glyph.
+fn logo_pixbuf(state: FaceState) -> Option<Pixbuf> {
+    TINTED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, pb)) = cache.iter().find(|(s, _)| *s == state) {
+            return Some(pb.clone());
+        }
+        let base = load_base_logo()?;
+        let pb = tint(&base, state.accent())?;
+        cache.push((state, pb.clone()));
+        Some(pb)
+    })
+}
 
-        let sweep_y = (23.0 + sweep * 18.0) * scale;
-        set(0.16);
-        round_rect(
-            cr,
-            13.0 * scale,
-            sweep_y - 5.0 * scale,
-            38.0 * scale,
-            10.0 * scale,
-            5.0 * scale,
-        );
-        cr.fill();
-        set(1.0);
-        round_rect(
-            cr,
-            13.0 * scale,
-            sweep_y - 1.0 * scale,
-            38.0 * scale,
-            2.5 * scale,
-            1.5 * scale,
-        );
-        cr.fill();
+/// Lazily decode `LOGO_PNG` and pre-scale it to `LOGO_TARGET_H` px tall
+/// (preserving aspect) so per-frame drawing stays cheap.
+fn load_base_logo() -> Option<Pixbuf> {
+    LOGO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let full = Pixbuf::from_read(LOGO_PNG).ok()?;
+            let w = full.width();
+            let h = full.height();
+            if h <= LOGO_TARGET_H {
+                slot.replace(full);
+            } else {
+                let target_w = ((w as f64 / h as f64) * LOGO_TARGET_H as f64).round() as i32;
+                slot.replace(full.scale_simple(
+                    target_w.max(1),
+                    LOGO_TARGET_H,
+                    InterpType::Bilinear,
+                )?);
+            }
+        }
+        slot.clone()
+    })
+}
+
+/// Replace the logo's RGB channels with the accent colour, keeping its alpha
+/// (the logo stroke is a neutral slate, so this just recolours it).
+fn tint(base: &Pixbuf, (r, g, b): (f64, f64, f64)) -> Option<Pixbuf> {
+    let out = base.copy()?;
+    let nch = out.n_channels();
+    let rowstride = out.rowstride();
+    let cr = (r * 255.0).round() as u8;
+    let cg = (g * 255.0).round() as u8;
+    let cb = (b * 255.0).round() as u8;
+    let px = unsafe { out.pixels() };
+    for row in 0..out.height() {
+        for col in 0..out.width() {
+            let i = (row * rowstride + col * nch) as usize;
+            px[i] = cr;
+            px[i + 1] = cg;
+            px[i + 2] = cb;
+        }
     }
-
-    cr.restore();
+    Some(out)
 }
 
 /// Rounded-rectangle helper (ports the extension's `_roundRect`).
@@ -188,8 +352,64 @@ mod tests {
     }
 
     #[test]
+    fn embedded_logo_is_png() {
+        // The asset must stay a valid PNG (magic header + IEND trailer).
+        assert_eq!(&LOGO_PNG[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(LOGO_PNG.len() > 16);
+        assert_eq!(&LOGO_PNG[LOGO_PNG.len() - 8..], b"IEND\xaeB`\x82");
+    }
+
+    #[test]
+    fn tint_preserves_alpha_and_sets_accent() {
+        // Load the base logo, tint it Scanning-amber, and confirm the RGB is
+        // the accent while transparency (alpha) is untouched.
+        let base = load_base_logo().expect("logo must load");
+        let amber = FaceState::Scanning.accent();
+        let tinted = tint(&base, amber).expect("tint must succeed");
+        assert_eq!(base.width(), tinted.width());
+        assert_eq!(base.height(), tinted.height());
+        assert_eq!(tinted.n_channels(), base.n_channels());
+        let nch = base.n_channels();
+        let rowstride = tinted.rowstride();
+        let b = unsafe { base.pixels() };
+        let t = unsafe { tinted.pixels() };
+        let mut colored = 0;
+        let mut transparent_kept = 0;
+        for row in (0..tinted.height()).step_by(4) {
+            for col in (0..tinted.width()).step_by(4) {
+                let i = (row * rowstride + col * nch) as usize;
+                if b[i + 3] > 0 {
+                    assert_eq!(t[i], (amber.0 * 255.0).round() as u8, "R at ({col},{row})");
+                    assert_eq!(
+                        t[i + 1],
+                        (amber.1 * 255.0).round() as u8,
+                        "G at ({col},{row})"
+                    );
+                    assert_eq!(
+                        t[i + 2],
+                        (amber.2 * 255.0).round() as u8,
+                        "B at ({col},{row})"
+                    );
+                    assert_eq!(t[i + 3], b[i + 3], "alpha changed at ({col},{row})");
+                    colored += 1;
+                } else {
+                    transparent_kept += 1;
+                }
+            }
+        }
+        assert!(colored > 0, "no opaque pixels to tint");
+        assert!(
+            transparent_kept > 0,
+            "no transparent pixels — logo is not see-through"
+        );
+    }
+
+    #[test]
     fn draws_without_panicking() {
-        // Paint onto an in-memory surface the way the widget would.
+        // Paint onto an in-memory surface the way the widget would. The
+        // embedded logo is decoded lazily; if gdk-pixbuf is unavailable in
+        // the test environment the legacy glyph is drawn instead — the point
+        // here is that neither path panics.
         let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 64, 64).unwrap();
         let cr = Context::new(&surface).unwrap();
         for s in [

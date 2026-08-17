@@ -470,7 +470,10 @@ pub fn verify(
         );
         return Err(err);
     }
-    crate::state::broadcast_state(daemon, &StateEvent::scanning(user));
+    // The `scanning` event is broadcast inside verify_inner, only once the
+    // camera is acquired and capture is about to start. Broadcasting it here
+    // would lie to the status indicator when no camera is available (or the
+    // user has no templates), which fails without ever scanning.
     match verify_inner(daemon, caller, user, service, timeout_ms) {
         Ok(mut result) => {
             // Action-approval gate: for non-login services (sudo, lock,
@@ -751,6 +754,11 @@ fn verify_inner(
         .pipeline
         .read()
         .map_err(|_| AuthError::Internal("pipeline lock poisoned".into()))?;
+
+    // The camera is acquired, pinned, and ready: only now tell watchers the
+    // scan has started. Every earlier exit (no templates, camera unavailable,
+    // camera mismatch) fails without a scan, so it must not broadcast one.
+    crate::state::broadcast_state(daemon, &StateEvent::scanning(user));
 
     let mut variance = VarianceTracker::new();
     let mut motion = MotionTracker::new();
@@ -1506,8 +1514,10 @@ pub fn enroll(
     if let Err(err) = policy_gate(daemon, user) {
         return Err(err.to_string());
     }
-    crate::state::broadcast_state(daemon, &StateEvent::enrolling(user));
-
+    // The `enrolling` event is broadcast inside enroll_inner, only once the
+    // camera is acquired and capture is about to start. Broadcasting it here
+    // would lie to the status indicator when the camera is unavailable,
+    // which fails without ever scanning.
     match enroll_inner(daemon, caller, user, max_models) {
         Ok(outcome) => {
             let added = outcome.result.added;
@@ -1766,6 +1776,12 @@ fn enroll_inner(
 
     let existing_templates = load_templates(daemon, user).map_err(|e| e.to_string())?;
     let target = max_models.min(max_per_user.saturating_sub(existing_templates.len()));
+
+    // The camera is acquired and ready: only now tell watchers the session
+    // has started. Every earlier exit (template limit, no such user, camera
+    // unavailable, camera mismatch) fails without a scan, so it must not
+    // broadcast an enrolling event.
+    crate::state::broadcast_state(daemon, &StateEvent::enrolling(user));
 
     let mut candidates: Vec<(Embedding, QualityReport)> = Vec::new();
     let mut variance = VarianceTracker::new();

@@ -158,9 +158,12 @@ secure_dialog = "/usr/lib/hiro/hiro-approve"
 # first-class indicator, and hiro-ui covers every other desktop (and GNOME
 # sessions without the extension enabled).
 #
-# active = "auto" (default): render unless running on GNOME with the
-# hiro-status@hiro Shell extension enabled — the extension owns the UI
-# there, so hiro-ui defers (exits).
+# active = "auto" (default): render unless the hiro-status@hiro Shell
+# extension reports enabled. That probe runs against the live GNOME Shell
+# over D-Bus, so it detects GNOME sessions even when hiro-ui was launched
+# by a systemd user unit that never inherited the desktop session's
+# XDG_CURRENT_DESKTOP / DESKTOP_SESSION variables — the extension owns the
+# UI there, so hiro-ui defers (exits).
 # active = "on": always render, ignoring desktop/extension detection.
 # active = "off": never render (rely on the extension, the secure console,
 # or no UI at all).

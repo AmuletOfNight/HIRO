@@ -3,6 +3,8 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
 import Cairo from 'gi://cairo';
+import Gdk from 'gi://Gdk';
+import GdkPixbuf from 'gi://GdkPixbuf';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -15,7 +17,7 @@ const TRANSITION_MS = 150;
 const POP_IN_MS = 220;
 const POP_SETTLE_MS = 120;
 const HIDE_MS = 220;
-const METER_WIDTH = 150;
+const METER_WIDTH = 190;
 const FACE_SCAN_MS = 1200;
 // Accent color per status; used by the Cairo-drawn face.
 const FACE_ACCENT = {
@@ -53,6 +55,8 @@ export default class HiroStatusExtension extends Extension {
         this._faceState = null;
         this._faceTimeline = null;
         this._faceTimelineId = 0;
+        this._logo = null;
+        this._loadLogo();
         this._hintText = null;
         this._hintAt = 0;
         this._lockChangedId = 0;
@@ -87,7 +91,7 @@ export default class HiroStatusExtension extends Extension {
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.START,
         });
-        this._overlay.set_translation(0, 18, 0);
+        this._overlay.set_translation(0, 0, 0);
         this._overlay.set_pivot_point(0.5, 0.5);
         this._column = new St.BoxLayout({style_class: 'hiro-status-column', vertical: true});
 
@@ -99,7 +103,7 @@ export default class HiroStatusExtension extends Extension {
             height: 5,
         }));
         this._brandRow.add_child(new St.Label({
-            text: 'hiro',
+            text: 'HIRO',
             style_class: 'hiro-brand',
         }));
         this._column.add_child(this._brandRow);
@@ -120,13 +124,13 @@ export default class HiroStatusExtension extends Extension {
         // daemon's scanning telemetry, plus an actionable hint.
         this._varianceFill = new St.Widget({
             style_class: 'hiro-meter-fill hiro-meter-fill-var',
-            height: 6,
+            height: 8,
             width: 0,
             x_align: Clutter.ActorAlign.START,
         });
         this._motionFill = new St.Widget({
             style_class: 'hiro-meter-fill hiro-meter-fill-mot',
-            height: 6,
+            height: 8,
             width: 0,
             x_align: Clutter.ActorAlign.START,
         });
@@ -233,17 +237,39 @@ export default class HiroStatusExtension extends Extension {
         this._indicator = null;
         this._icon = null;
         this._face = null;
+        this._logo = null;
+    }
+
+    // The full HIRO logo (Logo/HIRO.svg's raster export, shipped next to the
+    // extension). Loaded once and pre-scaled to ~240 px tall so per-frame
+    // drawing stays cheap; if it is missing or undecodable the drawing falls
+    // back to the legacy hand-drawn smiley so the indicator still works.
+    _loadLogo() {
+        try {
+            const file = this.dir.get_child('hiro-logo.png');
+            if (!file || !file.query_exists(null)) return;
+            const full = GdkPixbuf.Pixbuf.new_from_file(file.get_path());
+            const h = full.get_height();
+            if (h > 240) {
+                const w = Math.round(full.get_width() * 240 / h);
+                this._logo = full.scale_simple(w, 240, GdkPixbuf.InterpType.BILINEAR);
+            } else {
+                this._logo = full;
+            }
+        } catch (e) {
+            log(`hiro-status: load logo: ${e?.message}`);
+        }
     }
 
     _makeFace() {
-        // A Cairo-drawn actor: the whole smiley (ring, eyes, mouth, scan
-        // brackets and sweep) is repainted on every animation frame, so the
-        // motion does not depend on child-actor transforms that may not
-        // repaint reliably across shell versions.
+        // A Cairo-drawn actor: the whole HIRO logo (glyph, scan brackets and
+        // sweep) is repainted on every animation frame, so the motion does
+        // not depend on child-actor transforms that may not repaint reliably
+        // across shell versions.
         const face = new St.DrawingArea({
             style_class: 'hiro-face',
-            width: 64,
-            height: 64,
+            width: 96,
+            height: 96,
             reactive: false,
         });
         face.set_pivot_point(0.5, 0.5);
@@ -325,11 +351,98 @@ export default class HiroStatusExtension extends Extension {
             cr.translate(-cx, -cy);
         }
 
-        // Outer glow, ring, and face plate.
-        this._setRgba(cr, accent, 0.10);
-        cr.arc(cx, cy, 26 * scale, 0, 2 * Math.PI);
-        cr.fill();
+        let frame;
+        if (this._logo) {
+            // The logo is portrait (smiley over the HIRO wordmark), so fit it
+            // to the 60-tall scan zone (2..62 of the 64-grid), centred.
+            const pb = this._logo;
+            const aspect = pb.get_width() / pb.get_height();
+            const th = 60 * scale;
+            const tw = th * aspect;
+            const dx = cx - tw / 2;
+            const dy = cy - th / 2;
 
+            // Only the logo's own strokes are drawn — the background stays
+            // transparent so the overlay colour shows through.
+            cr.save();
+            cr.translate(dx, dy);
+            cr.scale(tw / pb.get_width(), th / pb.get_height());
+            Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0);
+            cr.paint();
+            cr.restore();
+
+            // The logo stroke is a neutral slate, so recolour it with the
+            // status accent (keeps its alpha via the IN operator).
+            cr.save();
+            cr.setOperator(Cairo.Operator.IN);
+            const [r, g, b, a] = this._hexToRgba(accent, 1);
+            cr.setSourceRGBA(r, g, b, a);
+            cr.rectangle(dx, dy, tw, th);
+            cr.fill();
+            cr.restore();
+
+            frame = {
+                fx: dx - 1.5 * scale,
+                fy: dy - 1.5 * scale,
+                fw: tw + 3 * scale,
+                fh: th + 3 * scale,
+                sweepX: dx + 2 * scale,
+                sweepW: tw - 4 * scale,
+                sweepA: dy + 2 * scale,
+                sweepB: dy + th - 2 * scale,
+            };
+        } else {
+            // Fallback: the legacy hand-drawn smiley glyph.
+            this._drawLegacyFace(cr, scale, cx, cy, state, accent);
+            frame = {
+                fx: 6 * scale,
+                fy: 6 * scale,
+                fw: 52 * scale,
+                fh: 52 * scale,
+                sweepX: 13 * scale,
+                sweepW: 38 * scale,
+                sweepA: 23 * scale,
+                sweepB: 41 * scale,
+            };
+        }
+
+        // Scan brackets and the sweeping line while scanning.
+        if (scanning) {
+            const arm = 8 * scale;
+            cr.setLineWidth(2 * scale);
+            this._setRgba(cr, accent, 1);
+            cr.newSubPath();
+            cr.moveTo(frame.fx, frame.fy + arm);
+            cr.lineTo(frame.fx, frame.fy);
+            cr.lineTo(frame.fx + arm, frame.fy);
+            cr.moveTo(frame.fx + frame.fw - arm, frame.fy);
+            cr.lineTo(frame.fx + frame.fw, frame.fy);
+            cr.lineTo(frame.fx + frame.fw, frame.fy + arm);
+            cr.moveTo(frame.fx, frame.fy + frame.fh - arm);
+            cr.lineTo(frame.fx, frame.fy + frame.fh);
+            cr.lineTo(frame.fx + arm, frame.fy + frame.fh);
+            cr.moveTo(frame.fx + frame.fw - arm, frame.fy + frame.fh);
+            cr.lineTo(frame.fx + frame.fw, frame.fy + frame.fh);
+            cr.lineTo(frame.fx + frame.fw, frame.fy + frame.fh - arm);
+            cr.stroke();
+
+            const sweepY = frame.sweepA + this._sweep * (frame.sweepB - frame.sweepA);
+            this._setRgba(cr, accent, 0.16);
+            this._roundRect(cr, frame.sweepX, sweepY - 5 * scale, frame.sweepW, 10 * scale, 5 * scale);
+            cr.fill();
+            this._setRgba(cr, accent, 1);
+            this._roundRect(cr, frame.sweepX, sweepY - 1 * scale, frame.sweepW, 2.5 * scale, 1.5 * scale);
+            cr.fill();
+        }
+
+        cr.restore();
+        cr.$dispose();
+    }
+
+    // The pre-logo hand-drawn glyph, used only when the shipped smiley PNG
+    // cannot be loaded so the indicator never goes blank.
+    _drawLegacyFace(cr, scale, cx, cy, state, accent) {
+        // Ring and face plate.
         this._setRgba(cr, accent, 0.92);
         cr.setLineWidth(1.6 * scale);
         cr.setLineCap(Cairo.LineCap.ROUND);
@@ -355,37 +468,6 @@ export default class HiroStatusExtension extends Extension {
             cr.arc(cx, 37.5 * scale, 9 * scale, Math.PI * 0.15, Math.PI * 0.85);
         }
         cr.stroke();
-
-        // Scan brackets and the sweeping line while scanning.
-        if (scanning) {
-            cr.setLineWidth(2 * scale);
-            this._setRgba(cr, accent, 1);
-            cr.newSubPath();
-            cr.moveTo(6 * scale, 14 * scale);
-            cr.lineTo(6 * scale, 6 * scale);
-            cr.lineTo(14 * scale, 6 * scale);
-            cr.moveTo(50 * scale, 6 * scale);
-            cr.lineTo(58 * scale, 6 * scale);
-            cr.lineTo(58 * scale, 14 * scale);
-            cr.moveTo(6 * scale, 50 * scale);
-            cr.lineTo(6 * scale, 58 * scale);
-            cr.lineTo(14 * scale, 58 * scale);
-            cr.moveTo(50 * scale, 58 * scale);
-            cr.lineTo(58 * scale, 58 * scale);
-            cr.lineTo(58 * scale, 50 * scale);
-            cr.stroke();
-
-            const sweepY = (23 + this._sweep * 18) * scale;
-            this._setRgba(cr, accent, 0.16);
-            this._roundRect(cr, 13 * scale, sweepY - 5 * scale, 38 * scale, 10 * scale, 5 * scale);
-            cr.fill();
-            this._setRgba(cr, accent, 1);
-            this._roundRect(cr, 13 * scale, sweepY - 1 * scale, 38 * scale, 2.5 * scale, 1.5 * scale);
-            cr.fill();
-        }
-
-        cr.restore();
-        cr.$dispose();
     }
 
     _setRgba(cr, hex, alpha) {
@@ -415,11 +497,11 @@ export default class HiroStatusExtension extends Extension {
 
     _makeMeterRow(caption, fill) {
         const cap = new St.Label({text: caption, style_class: 'hiro-meter-caption'});
-        cap.set_width(96);
+        cap.set_width(110);
         const track = new St.Bin({
             style_class: 'hiro-meter-track',
             width: METER_WIDTH,
-            height: 6,
+            height: 8,
         });
         track.set_child(fill);
         const row = new St.BoxLayout({style_class: 'hiro-meter-row', vertical: false});
@@ -847,9 +929,13 @@ export default class HiroStatusExtension extends Extension {
     _isImmediateFailure(state, reason) {
         if (state !== 'failure') return false;
         const r = String(reason || '').toLowerCase();
+        // Camera failures happen before/without a real scan (unavailable,
+        // mismatched, unreadable frames), so the indicator must say so
+        // immediately instead of flashing "Scanning your face" first.
         return r.includes('rate_limited') || r.includes('rate limited') ||
             r.includes('locked_out') || r.includes('locked out') ||
-            r.includes('password_required') || r.includes('password required');
+            r.includes('password_required') || r.includes('password required') ||
+            r.includes('camera') || r.includes('no_luma');
     }
 
     _reasonLabel(reason) {
@@ -898,8 +984,9 @@ export default class HiroStatusExtension extends Extension {
     }
 
     _queueResult(state, score, reason, accepted, target, rejected) {
-        // Rate-limited / locked-out requests are rejected before any scan
-        // happens, so tell the user immediately instead of faking a scan.
+        // Rate-limited / locked-out / password-required / camera-failure
+        // requests are rejected before any scan happens, so tell the user
+        // immediately instead of faking a scan.
         if (this._isImmediateFailure(state, reason)) {
             this._cancelResultTimer();
             this._cancelHideTimer();
@@ -1031,12 +1118,12 @@ export default class HiroStatusExtension extends Extension {
 
     _positionOverlay() {
         // uiGroup's layout does not center children, so place it explicitly
-        // relative to the primary monitor.
+        // relative to the primary monitor, centered both ways.
         const [, natW] = this._overlay.get_preferred_width(-1);
         const [, natH] = this._overlay.get_preferred_height(-1);
         const mon = Main.layoutManager.primaryMonitor;
         const x = Math.round(mon.x + (mon.width - natW) / 2);
-        const y = Math.round(mon.y + 24);
+        const y = Math.round(mon.y + (mon.height - natH) / 2);
         this._overlay.set_position(x, y);
     }
 

@@ -37,6 +37,8 @@ override_dh_auto_install:
 		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/metadata.json
 	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/extension.js \
 		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/extension.js
+	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/hiro-logo.png \
+		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/hiro-logo.png
 	install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css \
 		$(DESTDIR)/usr/share/gnome-shell/extensions/hiro-status@hiro/stylesheet.css
 	# Model fetch script + manifest

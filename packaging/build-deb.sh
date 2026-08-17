@@ -45,6 +45,7 @@ install -Dm644 packaging/pam-configs/hiro              "$D/usr/share/pam-configs
 install -Dm644 packaging/polkit/hiro.conf              "$D/usr/share/hiro/polkit-agent-helper-hiro.conf"
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/metadata.json    "$D/usr/share/gnome-shell/extensions/hiro-status@hiro/metadata.json"
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/extension.js     "$D/usr/share/gnome-shell/extensions/hiro-status@hiro/extension.js"
+install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/hiro-logo.png "$D/usr/share/gnome-shell/extensions/hiro-status@hiro/hiro-logo.png"
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css   "$D/usr/share/gnome-shell/extensions/hiro-status@hiro/stylesheet.css"
 install -Dm755 scripts/fetch-models.sh                 "$D/usr/share/hiro/fetch-models.sh"
 install -Dm644 crates/hiro-face/models/manifest.toml   "$D/usr/share/hiro/models/manifest.toml"

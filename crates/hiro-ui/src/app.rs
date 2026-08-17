@@ -1,9 +1,9 @@
 //! GTK3 overlay card: scanning indicator, approval prompt, result flash.
 //!
 //! A desktop-agnostic port of the GNOME Shell extension's behaviour: a
-//! frameless, always-on-top card pinned near the top of the primary monitor
-//! that shows live scan progress, Allow/Deny approval buttons (with the
-//! countdown and step-away handling), and result flashes.
+//! frameless, always-on-top card centered on the primary monitor that shows
+//! live scan progress, Allow/Deny approval buttons (with the countdown and
+//! step-away handling), and result flashes.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -42,51 +42,51 @@ window {
 #hiro-card {
     background-color: #1c2128;
     border: 1px solid #2d333b;
-    border-radius: 12px;
-    padding: 14px 18px;
+    border-radius: 16px;
+    padding: 18px 26px;
 }
 #hiro-brand {
     color: #768390;
-    font-size: 10px;
+    font-size: 11px;
     font-weight: bold;
     letter-spacing: 3px;
 }
 #hiro-label {
     color: #c9d1d9;
-    font-size: 14px;
+    font-size: 17px;
 }
 #hiro-hint {
     color: #768390;
-    font-size: 12px;
+    font-size: 14px;
 }
 #hiro-meter-caption {
     color: #768390;
-    font-size: 11px;
+    font-size: 12px;
 }
 progressbar.hiro-meter > trough {
     background-color: #2d333b;
-    border-radius: 3px;
-    min-height: 6px;
+    border-radius: 4px;
+    min-height: 8px;
 }
 progressbar.hiro-meter > trough > progress {
-    border-radius: 3px;
-    min-height: 6px;
+    border-radius: 4px;
+    min-height: 8px;
 }
 progressbar.hiro-meter-var > trough > progress { background-color: #ffd166; }
 progressbar.hiro-meter-mot > trough > progress { background-color: #4fc3f7; }
 progressbar.hiro-meter-ok > trough > progress { background-color: #66bb6a; }
 #hiro-approval-title {
     color: #e6edf3;
-    font-size: 14px;
+    font-size: 17px;
     font-weight: bold;
 }
 #hiro-approval-sub {
     color: #adbac7;
-    font-size: 12px;
+    font-size: 14px;
 }
 button.hiro-approval-btn {
-    border-radius: 6px;
-    padding: 8px 20px;
+    border-radius: 8px;
+    padding: 10px 26px;
     font-weight: bold;
     border: none;
 }
@@ -244,15 +244,18 @@ impl App {
         w.set_type_hint(gdk::WindowTypeHint::Dialog);
         w.set_accept_focus(false);
         w.set_resizable(false);
-        w.set_size_request(300, -1);
+        w.set_size_request(400, -1);
         w.set_opacity(0.0);
         {
+            // Keep the card centered on the primary monitor whenever its
+            // size changes (e.g. the meters/approval box appear).
             w.connect_size_allocate(move |win, alloc| {
                 if let Some(display) = gdk::Display::default() {
                     if let Some(monitor) = display.primary_monitor() {
                         let geo = monitor.geometry();
                         let x = ((geo.width() - alloc.width()) / 2).max(0);
-                        win.move_(x, 24);
+                        let y = ((geo.height() - alloc.height()) / 2).max(0);
+                        win.move_(x, y);
                     }
                 }
             });
@@ -267,8 +270,8 @@ impl App {
         card.pack_start(&brand, false, false, 0);
 
         // Content row: animated face + status label.
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        self.face.set_size_request(64, 64);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        self.face.set_size_request(96, 96);
         {
             let face_app = self.rc();
             self.face.connect_draw(move |area, cr| {

@@ -5,5 +5,5 @@
   "shell-version": ["45", "46", "47", "48", "49", "50", "51", "52"],
   "session-modes": ["user", "unlock-dialog"],
   "url": "https://github.com/hiro-auth/hiro",
-  "version": 15
+  "version": 17
 }

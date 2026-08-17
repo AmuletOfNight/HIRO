@@ -2,7 +2,7 @@
 
 mod client;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use hiro_core::proto::{Op, ResultValue};
@@ -452,7 +452,7 @@ fn print_ui_line() {
         UiMode::Off => "off".to_string(),
         UiMode::On => "hiro-ui (forced)".to_string(),
         UiMode::Auto => {
-            if hiro_core::ui::desktop_is_gnome() && hiro_core::ui::gnome_extension_enabled() {
+            if hiro_core::ui::gnome_extension_enabled() {
                 "GNOME extension (hiro-ui defers)".to_string()
             } else {
                 "hiro-ui".to_string()
@@ -552,20 +552,21 @@ fn doctor() {
             println!("[ui] active        : {mode}");
             if cfg.ui.active == UiMode::Off {
                 println!("session UI disabled by config");
-            } else if hiro_core::ui::desktop_is_gnome() && hiro_core::ui::gnome_extension_enabled()
-            {
+            } else if hiro_core::ui::gnome_extension_enabled() {
                 println!("running UI         : GNOME Shell extension (hiro-status@hiro)");
                 if cfg.ui.active == UiMode::Auto {
                     println!("hiro-ui            : defers (extension owns the UI)");
                 } else {
                     println!("hiro-ui            : forced on by config");
+                    print_ui_install_status();
                 }
             } else {
                 println!("running UI         : hiro-ui (desktop-agnostic fallback)");
-                if !hiro_core::ui::desktop_is_gnome() {
-                    println!("desktop            : not GNOME");
-                } else {
+                print_ui_install_status();
+                if hiro_core::ui::desktop_is_gnome() {
                     println!("desktop            : GNOME, but the extension is not enabled");
+                } else {
+                    println!("desktop            : not GNOME");
                 }
             }
         }
@@ -579,5 +580,19 @@ fn doctor() {
         Ok(ResultValue::Pong { daemon }) => println!("daemon reachable (v{daemon})"),
         Ok(_) => println!("daemon gave an unexpected answer"),
         Err(e) => println!("daemon not reachable: {e}"),
+    }
+}
+
+/// Warn when `hiro-ui` is expected to render but its binary (or the launch
+/// wiring that starts it in a graphical session) is not installed.
+fn print_ui_install_status() {
+    if !Path::new("/usr/bin/hiro-ui").exists() {
+        println!("hiro-ui            : NOT INSTALLED (no /usr/bin/hiro-ui)");
+        println!("                     redeploy with scripts/redeploy.sh or reinstall the .deb");
+    } else if !Path::new("/usr/lib/systemd/user/hiro-ui.service").exists()
+        && !Path::new("/etc/xdg/autostart/hiro-ui.desktop").exists()
+    {
+        println!("hiro-ui            : installed, but no autostart wiring found");
+        println!("                     (systemd user unit / XDG autostart entry missing)");
     }
 }

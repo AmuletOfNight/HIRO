@@ -1,6 +1,8 @@
 //! V4L2 capture behind a [`VideoSource`] abstraction.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
@@ -37,6 +39,17 @@ pub trait VideoSource: Send {
     /// already turned away by the time the next request arrives). The
     /// default implementation does nothing.
     fn drain(&mut self) {}
+
+    /// Whether the source can still deliver frames.
+    ///
+    /// The default `true` is correct for sources without an internal thread
+    /// (mocks). The V4L2 implementation overrides this so the camera
+    /// session can detect a capture thread that exited when the device was
+    /// unplugged (or killed by an I/O error) and rebuild itself from a
+    /// fresh probe instead of serving a dead channel forever.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// mmap-streaming V4L2 source. Capture runs on a dedicated thread; frames
@@ -52,6 +65,19 @@ pub struct V4lSource {
     control: Option<SyncSender<()>>,
     frames: Option<Receiver<Frame>>,
     started: bool,
+    /// Set to `false` by the capture thread when it exits (cleanly or on
+    /// error), so callers can tell a live stream from one whose thread died
+    /// because the device was unplugged. `None` while not streaming.
+    running: Option<Arc<AtomicBool>>,
+}
+
+/// Capture geometry handed to the capture thread.
+struct CaptureSpec {
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    fps: u32,
+    fourcc: [u8; 4],
 }
 
 impl V4lSource {
@@ -74,6 +100,7 @@ impl V4lSource {
             control: None,
             frames: None,
             started: false,
+            running: None,
         })
     }
 
@@ -85,23 +112,20 @@ impl V4lSource {
     }
 
     fn spawn_capture_thread(
-        path: PathBuf,
-        width: u32,
-        height: u32,
-        fps: u32,
-        fourcc: [u8; 4],
+        spec: CaptureSpec,
         frames: SyncSender<Frame>,
         shutdown: Receiver<()>,
+        running: Arc<AtomicBool>,
     ) -> HwResult<()> {
         std::thread::Builder::new()
             .name("hiro-capture".into())
             .spawn(move || {
                 let run = || -> HwResult<()> {
-                    let dev = Device::with_path(&path).map_err(|e| {
-                        HwError::Camera(format!("cannot open {}: {e}", path.display()))
+                    let dev = Device::with_path(&spec.path).map_err(|e| {
+                        HwError::Camera(format!("cannot open {}: {e}", spec.path.display()))
                     })?;
 
-                    let requested = Format::new(width, height, FourCC::new(&fourcc));
+                    let requested = Format::new(spec.width, spec.height, FourCC::new(&spec.fourcc));
                     let negotiated = match dev.set_format(&requested) {
                         Ok(f) => f,
                         Err(_) => {
@@ -115,17 +139,17 @@ impl V4lSource {
                                 .or_else(|| formats.first());
                             match pick {
                                 Some(d) => dev
-                                    .set_format(&Format::new(width, height, d.fourcc))
+                                    .set_format(&Format::new(spec.width, spec.height, d.fourcc))
                                     .map_err(|e| {
                                         HwError::UnsupportedFormat(format!(
                                             "{}: no compatible capture format: {e}",
-                                            path.display()
+                                            spec.path.display()
                                         ))
                                     })?,
                                 None => {
                                     return Err(HwError::UnsupportedFormat(format!(
                                         "{} lists no capture formats",
-                                        path.display()
+                                        spec.path.display()
                                     )));
                                 }
                             }
@@ -133,28 +157,28 @@ impl V4lSource {
                     };
                     let neg_fourcc: [u8; 4] = u32::from(negotiated.fourcc).to_le_bytes();
                     let (fwidth, fheight) = (negotiated.width.max(1), negotiated.height.max(1));
-                    if neg_fourcc != fourcc || fwidth != width || fheight != height {
+                    if neg_fourcc != spec.fourcc || fwidth != spec.width || fheight != spec.height {
                         log::warn!(
                             "camera negotiated {} {}x{} (configured: {} {}x{}) on {}",
                             String::from_utf8_lossy(&neg_fourcc),
                             fwidth,
                             fheight,
-                            String::from_utf8_lossy(&fourcc),
-                            width,
-                            height,
-                            path.display()
+                            String::from_utf8_lossy(&spec.fourcc),
+                            spec.width,
+                            spec.height,
+                            spec.path.display()
                         );
                     }
 
-                    if fps > 0 {
-                        let _ = dev.set_params(&Parameters::with_fps(fps));
+                    if spec.fps > 0 {
+                        let _ = dev.set_params(&Parameters::with_fps(spec.fps));
                     }
 
                     let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4)
                         .map_err(|e| {
                             HwError::Camera(format!(
                                 "cannot set up mmap stream on {}: {e}",
-                                path.display()
+                                spec.path.display()
                             ))
                         })?;
                     stream.set_timeout(Duration::from_millis(500));
@@ -188,14 +212,14 @@ impl V4lSource {
                                 // re-queues every buffer cleanly.
                                 log::debug!(
                                     "capture: frame read timed out on {}; resetting stream",
-                                    path.display()
+                                    spec.path.display()
                                 );
                                 let _ = StreamTrait::stop(&mut stream);
                             }
                             Err(e) => {
                                 return Err(HwError::Camera(format!(
                                     "capture failed on {}: {e}",
-                                    path.display()
+                                    spec.path.display()
                                 )));
                             }
                         }
@@ -206,6 +230,11 @@ impl V4lSource {
                 if let Err(e) = run() {
                     log::warn!("capture thread stopped: {e}");
                 }
+                // The thread is exiting, for whatever reason: a live stream
+                // has become a dead one. Callers poll this flag (is_alive)
+                // so the session can rebuild the source instead of serving a
+                // dead channel forever.
+                running.store(false, Ordering::SeqCst);
             })
             .map_err(|e| HwError::Camera(format!("cannot spawn capture thread: {e}")))?;
         Ok(())
@@ -217,19 +246,37 @@ impl VideoSource for V4lSource {
         if self.started {
             return Ok(());
         }
+        // Fail fast if the node is gone or unopenable (e.g. the camera was
+        // unplugged since the source was built). Without this check the
+        // capture thread would spawn, fail to open the device, and exit,
+        // and the caller would only discover the failure on the *next*
+        // frame read as "capture thread exited".
+        discover::probe_device(&self.path).inspect_err(|_| {
+            // Mark the source dead so the session re-discovers (and
+            // re-picks) the camera on its next acquire() instead of
+            // retrying this stale path — the camera may have returned at a
+            // different /dev/videoN node.
+            self.running = Some(Arc::new(AtomicBool::new(false)));
+        })?;
         let (control_tx, control_rx) = sync_channel::<()>(1);
         let (frame_tx, frame_rx) = sync_channel::<Frame>(4);
+        let running = Arc::new(AtomicBool::new(true));
+        let running_in_thread = running.clone();
         Self::spawn_capture_thread(
-            self.path.clone(),
-            self.width,
-            self.height,
-            self.fps,
-            self.fourcc,
+            CaptureSpec {
+                path: self.path.clone(),
+                width: self.width,
+                height: self.height,
+                fps: self.fps,
+                fourcc: self.fourcc,
+            },
             frame_tx,
             control_rx,
+            running_in_thread,
         )?;
         self.control = Some(control_tx);
         self.frames = Some(frame_rx);
+        self.running = Some(running);
         self.started = true;
         Ok(())
     }
@@ -255,6 +302,7 @@ impl VideoSource for V4lSource {
         }
         self.frames = None;
         self.started = false;
+        self.running = None;
     }
 
     fn drain(&mut self) {
@@ -265,6 +313,16 @@ impl VideoSource for V4lSource {
             // captured after it started.
             while rx.try_recv().is_ok() {}
         }
+    }
+
+    fn is_alive(&self) -> bool {
+        // No running flag: not started (or stopped cleanly) — a healthy
+        // state that `start()` can resume. A flag the capture thread has
+        // cleared (device unplugged, I/O error killed the thread) means the
+        // source is dead and the session must re-discover and rebuild it.
+        self.running
+            .as_ref()
+            .is_none_or(|r| r.load(Ordering::SeqCst))
     }
 
     fn identity(&self) -> CameraIdentity {

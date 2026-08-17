@@ -114,8 +114,10 @@ See `docs/security.md` for the full threat model. Highlights:
 
 A GNOME Shell extension (`hiro-status@hiro`, installed by the package)
 shows an animated indicator while your face is being scanned — a pulsing
-camera icon in the top bar plus a centered overlay with a dot animation,
-then a green check (with score) or red failure. It works on the desktop,
+camera icon in the top bar plus a centered overlay with the HIRO logo
+(rendered in the status colour, amber while scanning) framed by scan
+brackets with a sweeping highlight, then a green check (with score) or red
+failure. It works on the desktop,
 the lock screen, and anywhere the shell runs. The top-bar icon only
 appears while a scan (or its result flash) is on screen and hides when
 idle, so it does not look like the camera is in use at all times. When a
@@ -147,8 +149,11 @@ flashes. It is installed and enabled by the package:
 
 - **systemd user service** (`hiro-ui.service`) or **XDG autostart** entry;
   a single-instance guard makes running both harmless.
-- It auto-defers to the GNOME Shell extension when that is the active UI;
-  control it with the `[ui]` section of `/etc/hiro/config.toml`
+- In `auto` mode it defers to the GNOME Shell extension whenever
+  `hiro-status@hiro` reports enabled (the `gnome-extensions` probe runs
+  against the live shell, so it works even when `hiro-ui` was started
+  without the desktop session's environment variables); control it with the
+  `[ui]` section of `/etc/hiro/config.toml`
   (`active = "auto" | "on" | "off"`, default `auto`). See `man hiro-ui`,
   `man hiro.conf`.
 - Disable it entirely (e.g. you only want the secure-console approval

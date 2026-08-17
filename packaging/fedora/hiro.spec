@@ -13,6 +13,7 @@ BuildRequires:  cargo
 BuildRequires:  gcc
 BuildRequires:  tss2-devel
 Requires:       pam
+Requires:       gtk3
 Recommends:     v4l-utils
 Suggests:       linux-enable-ir-emitter
 
@@ -30,6 +31,7 @@ cargo build --release --features hiro-face/onnx,hiro-tpm/tpm
 %install
 install -Dm755 target/release/hirod %{buildroot}%{_sbindir}/hirod
 install -Dm755 target/release/hiro %{buildroot}%{_bindir}/hiro
+install -Dm755 target/release/hiro-ui %{buildroot}%{_bindir}/hiro-ui
 install -Dm755 target/release/libpam_hiro.so %{buildroot}%{_libdir}/security/pam_hiro.so
 # Keep the secure-approval dialog at a distro-independent path so the
 # daemon's default approval.secure_dialog setting works everywhere.
@@ -40,27 +42,39 @@ install -Dm644 crates/hiro-hw/quirks.toml %{buildroot}%{_sysconfdir}/hiro/quirks
 
 install -Dm644 packaging/systemd/hirod.service %{buildroot}%{_unitdir}/hirod.service
 install -Dm644 packaging/systemd/hirod-resume.service %{buildroot}%{_unitdir}/hirod-resume.service
+# Session UI: systemd --user unit + XDG autostart entry (see the comment in
+# scripts/redeploy.sh; hiro-ui's single-instance lock makes double launch
+# harmless).
+install -Dm644 packaging/systemd-user/hiro-ui.service %{buildroot}%{_userunitdir}/hiro-ui.service
+install -Dm644 packaging/xdg-autostart/hiro-ui.desktop %{buildroot}%{_sysconfdir}/xdg/autostart/hiro-ui.desktop
 install -Dm644 packaging/udev/99-hiro.rules %{buildroot}%{_udevrulesdir}/99-hiro.rules
 install -Dm644 packaging/polkit/hiro.conf %{buildroot}%{_datadir}/hiro/polkit-agent-helper-hiro.conf
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/metadata.json %{buildroot}%{_datadir}/gnome-shell/extensions/hiro-status@hiro/metadata.json
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/extension.js %{buildroot}%{_datadir}/gnome-shell/extensions/hiro-status@hiro/extension.js
+install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/hiro-logo.png %{buildroot}%{_datadir}/gnome-shell/extensions/hiro-status@hiro/hiro-logo.png
 install -Dm644 packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css %{buildroot}%{_datadir}/gnome-shell/extensions/hiro-status@hiro/stylesheet.css
 
 install -Dm755 scripts/fetch-models.sh %{buildroot}%{_datadir}/hiro/fetch-models.sh
 install -Dm644 crates/hiro-face/models/manifest.toml %{buildroot}%{_datadir}/hiro/models/manifest.toml
 
 install -Dm644 man/hiro.1 %{buildroot}%{_mandir}/man1/hiro.1
+install -Dm644 man/hiro-ui.1 %{buildroot}%{_mandir}/man1/hiro-ui.1
 install -Dm644 man/hirod.8 %{buildroot}%{_mandir}/man8/hirod.8
 install -Dm644 man/pam_hiro.8 %{buildroot}%{_mandir}/man8/pam_hiro.8
 install -Dm644 man/hiro.conf.5 %{buildroot}%{_mandir}/man5/hiro.conf.5
 
 %post
 %systemd_post hirod.service hirod-resume.service
+# Per-user session UI: enable the user unit globally so every graphical
+# session starts hiro-ui (the XDG autostart entry covers sessions without a
+# systemd user manager). Failures are fine on systems without systemd --user.
+systemctl --global enable hiro-ui.service >/dev/null 2>&1 || :
 # Fedora uses authselect; PAM integration is a manual step (see docs/pam.md):
 #   authselect enable-feature with-hiro   (once a feature is shipped upstream)
 
 %preun
 %systemd_preun hirod.service hirod-resume.service
+systemctl --global disable hiro-ui.service >/dev/null 2>&1 || :
 
 %postun
 %systemd_postun hirod.service hirod-resume.service
@@ -70,6 +84,7 @@ install -Dm644 man/hiro.conf.5 %{buildroot}%{_mandir}/man5/hiro.conf.5
 %doc README.md docs/security.md docs/hardware.md docs/pam.md
 %{_sbindir}/hirod
 %{_bindir}/hiro
+%{_bindir}/hiro-ui
 %{_libdir}/security/pam_hiro.so
 %{_prefix}/lib/hiro/hiro-approve
 %dir %{_sysconfdir}/hiro
@@ -77,9 +92,12 @@ install -Dm644 man/hiro.conf.5 %{buildroot}%{_mandir}/man5/hiro.conf.5
 %config(noreplace) %{_sysconfdir}/hiro/quirks.toml
 %{_unitdir}/hirod.service
 %{_unitdir}/hirod-resume.service
+%{_userunitdir}/hiro-ui.service
+%config(noreplace) %{_sysconfdir}/xdg/autostart/hiro-ui.desktop
 %{_udevrulesdir}/99-hiro.rules
 %{_datadir}/hiro/
 %{_mandir}/man1/hiro.1*
+%{_mandir}/man1/hiro-ui.1*
 %{_mandir}/man8/hirod.8*
 %{_mandir}/man8/pam_hiro.8*
 %{_mandir}/man5/hiro.conf.5*

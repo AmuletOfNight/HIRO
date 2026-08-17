@@ -8,8 +8,9 @@
 #   sudo ./scripts/redeploy.sh --skip-build # reuse existing target/release
 #
 # Installs to the same paths as the .deb produced by packaging/build-deb.sh:
-#   /usr/sbin/hirod   /usr/bin/hiro   pam_hiro.so
+#   /usr/sbin/hirod   /usr/bin/hiro   /usr/bin/hiro-ui   pam_hiro.so
 #   /usr/lib/hiro/hiro-approve  (secure-desktop approval dialog)
+#   systemd user unit + XDG autostart entry for hiro-ui (session UI)
 #   /etc/hiro/config.toml(.example)   /etc/hiro/quirks.toml
 #   systemd units + udev rule + pam-config profile + polkit drop-in
 #   GNOME Shell extension  /usr/share/gnome-shell/extensions/hiro-status@hiro
@@ -137,6 +138,9 @@ fi
 echo "== installing binaries (PAM module -> $PAM_DIR) =="
 install -Dm755 "$REPO/target/release/hirod"          /usr/sbin/hirod
 install -Dm755 "$REPO/target/release/hiro"           /usr/bin/hiro
+# Desktop-agnostic session UI (GTK). Its systemd --user unit and XDG
+# autostart entry are installed below.
+install -Dm755 "$REPO/target/release/hiro-ui"        /usr/bin/hiro-ui
 install -Dm755 "$REPO/target/release/libpam_hiro.so" "$PAM_DIR/pam_hiro.so"
 # Secure-desktop approval dialog — the daemon spawns this via systemd-run
 # when approval.secure_desktop = true. Default approval.secure_dialog
@@ -157,6 +161,11 @@ install -m644 "$REPO/crates/hiro-hw/quirks.toml" /etc/hiro/quirks.toml
 echo "== installing systemd units, udev rule, PAM profile, polkit drop-in =="
 install -Dm644 "$REPO/packaging/systemd/hirod.service"        /lib/systemd/system/hirod.service
 install -Dm644 "$REPO/packaging/systemd/hirod-resume.service" /lib/systemd/system/hirod-resume.service
+# Session UI: a systemd --user unit for graphical sessions with a user
+# manager, plus an XDG autostart entry for sessions without one. hiro-ui's
+# single-instance lock makes a double launch harmless.
+install -Dm644 "$REPO/packaging/systemd-user/hiro-ui.service"  /usr/lib/systemd/user/hiro-ui.service
+install -Dm644 "$REPO/packaging/xdg-autostart/hiro-ui.desktop" /etc/xdg/autostart/hiro-ui.desktop
 install -Dm644 "$REPO/packaging/udev/99-hiro.rules"           /usr/lib/udev/rules.d/99-hiro.rules
 install -Dm644 "$REPO/packaging/pam-configs/hiro"             /usr/share/pam-configs/hiro
 install -Dm644 "$REPO/packaging/polkit/hiro.conf"             /usr/share/hiro/polkit-agent-helper-hiro.conf
@@ -171,6 +180,7 @@ echo "== installing GNOME Shell extension =="
 EXT_DIR="/usr/share/gnome-shell/extensions/hiro-status@hiro"
 install -Dm644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/metadata.json"   "$EXT_DIR/metadata.json"
 install -Dm644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/extension.js"    "$EXT_DIR/extension.js"
+install -Dm644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/hiro-logo.png" "$EXT_DIR/hiro-logo.png"
 install -Dm644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css"  "$EXT_DIR/stylesheet.css"
 
 # A user-local extension copy (per the README alternative install) would
@@ -181,12 +191,14 @@ if [ "$BUILD_USER" != "root" ]; then
         echo "== refreshing user-local extension copy ($LOCAL_EXT) =="
         install -m644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/metadata.json"   "$LOCAL_EXT/metadata.json"
         install -m644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/extension.js"    "$LOCAL_EXT/extension.js"
+        install -m644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/hiro-logo.png" "$LOCAL_EXT/hiro-logo.png"
         install -m644 "$REPO/packaging/gnome-shell-extension/hiro-status@hiro/stylesheet.css"  "$LOCAL_EXT/stylesheet.css"
     fi
 fi
 
 echo "== installing man pages, docs, model manifest, fetch script =="
 install -Dm644 "$REPO/man/hiro.1"       /usr/share/man/man1/hiro.1
+install -Dm644 "$REPO/man/hiro-ui.1"    /usr/share/man/man1/hiro-ui.1
 install -Dm644 "$REPO/man/hirod.8"      /usr/share/man/man8/hirod.8
 install -Dm644 "$REPO/man/pam_hiro.8"   /usr/share/man/man8/pam_hiro.8
 install -Dm644 "$REPO/man/hiro.conf.5"  /usr/share/man/man5/hiro.conf.5
@@ -231,6 +243,11 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "== enabling and restarting hirod =="
     systemctl daemon-reload
     systemctl enable hirod.service hirod-resume.service >/dev/null 2>&1 || true
+    # Per-user session UI: enable the user unit globally so every graphical
+    # session picks it up (the XDG autostart entry covers sessions without a
+    # systemd user manager; hiro-ui's single-instance guard makes double
+    # launch harmless). Failures are fine on systems without systemd --user.
+    systemctl --global enable hiro-ui.service >/dev/null 2>&1 || true
     if systemctl restart hirod; then
         RESTARTED=1
     else
@@ -259,6 +276,10 @@ echo "Next steps:"
 echo "   sudo hiro doctor          # sanity check (camera, IR, models, daemon)"
 echo "   hiro enroll               # if you have not enrolled your face yet"
 echo "   hiro test                 # verify recognition + liveness"
+echo
+echo "Session UI: hiro-ui (GTK indicator / approval prompt) will start in your"
+echo "next graphical session. To start it in the current session:"
+echo "   systemctl --user enable --now hiro-ui"
 echo
 echo "The GNOME Shell extension was updated system-wide. To load it in your"
 echo "session, restart the shell (Alt+F2, type 'r') or log out/in, then:"

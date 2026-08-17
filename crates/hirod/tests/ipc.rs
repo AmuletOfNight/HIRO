@@ -334,11 +334,13 @@ fn watch_streams_state_events() {
         }
     ));
 
-    // Expect scanning then failure events.
+    // Fails fast before any scanning happens (no templates): the watcher
+    // must see a failure event with no misleading "scanning" event first,
+    // exactly as it would for a camera-unavailable failure.
     let mut saw_scanning = false;
     let mut saw_failure = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline && !(saw_scanning && saw_failure) {
+    while std::time::Instant::now() < deadline && !saw_failure {
         let mut ev = String::new();
         if reader.read_line(&mut ev).unwrap_or(0) == 0 {
             break;
@@ -348,9 +350,12 @@ fn watch_streams_state_events() {
         }
         if ev.contains("\"failure\"") {
             saw_failure = true;
+            assert!(
+                !saw_scanning,
+                "pre-scan failure must not be preceded by a scanning event: {ev}"
+            );
         }
     }
-    assert!(saw_scanning, "never saw a scanning event");
     assert!(saw_failure, "never saw a failure event");
 
     drop(stream);

@@ -76,7 +76,10 @@ pub fn reason_label(reason: Option<&str>) -> Option<String> {
 ///
 /// Rate-limited / locked-out / password-required verdicts are rejected
 /// before any scanning happens, so the UI should tell the user immediately
-/// instead of flashing a scan that never occurred.
+/// instead of flashing a scan that never occurred. Camera failures
+/// (`camera_unavailable`, `camera_mismatch`, `no_luma`) are the same: the
+/// camera could not be used, so the indicator must say so right away
+/// instead of first claiming the user's face is being scanned.
 pub fn is_immediate_failure(state: &str, reason: Option<&str>) -> bool {
     if state != "failure" {
         return false;
@@ -88,6 +91,8 @@ pub fn is_immediate_failure(state: &str, reason: Option<&str>) -> bool {
         || r.contains("locked out")
         || r.contains("password_required")
         || r.contains("password required")
+        || r.contains("camera")
+        || r.contains("no_luma")
 }
 
 #[cfg(test)]
@@ -148,5 +153,18 @@ mod tests {
         assert!(is_immediate_failure("failure", Some("locked_out")));
         assert!(!is_immediate_failure("failure", Some("no_match")));
         assert!(!is_immediate_failure("success", Some("rate_limited")));
+    }
+
+    #[test]
+    fn camera_failures_are_immediate() {
+        // An unavailable camera fails without ever scanning the user's
+        // face, so the indicator must say so at once instead of flashing
+        // "Scanning your face…".
+        assert!(is_immediate_failure("failure", Some("camera_unavailable")));
+        assert!(is_immediate_failure("failure", Some("camera_mismatch")));
+        assert!(is_immediate_failure("failure", Some("no_luma")));
+        // But a genuine failed scan is not immediate.
+        assert!(!is_immediate_failure("failure", Some("no_face")));
+        assert!(!is_immediate_failure("success", Some("camera_unavailable")));
     }
 }

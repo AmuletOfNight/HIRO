@@ -68,6 +68,15 @@ face (score below the effective threshold minus
 waiting until the timeout. With \fIsecure_desktop\fR = true (default
 false) the prompt is shown on a dedicated VT by \fBhiro-approve\fR
 instead of the in-session indicator (\fIsecure_vt\fR, \fIsecure_dialog\fR).
+.TP
+.B [ui]
+Desktop-agnostic session UI (\fBhiro-ui\fR). \fIactive\fR is
+\fI"auto"\fR (default), \fI"on"\fR, or \fI"off"\fR. In \fIauto\fR mode
+hiro-ui renders unless the \fBhiro-status@hiro\fR GNOME Shell extension
+reports enabled — that probe runs against the live shell, so it does not
+depend on desktop environment variables (\fIXDG_CURRENT_DESKTOP\fR and
+friends are frequently missing in systemd user units). \fIon\fR forces
+rendering and \fIoff\fR disables the in-session UI entirely.
 .SH RELOADING
 Apply changes with:
 .B hiro reload

@@ -2,12 +2,12 @@
 .hiro-status-overlay {
     background-color: rgba(11, 17, 28, 0.94);
     border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 24px;
-    padding: 17px 24px 19px;
+    border-radius: 28px;
+    padding: 21px 30px 24px;
     box-shadow: 0 8px 28px rgba(0, 0, 0, 0.48), 0 0 0 1px rgba(255, 209, 102, 0.04);
 }
 .hiro-status-column {
-    spacing: 12px;
+    spacing: 14px;
 }
 .hiro-brand-row {
     spacing: 6px;
@@ -19,35 +19,38 @@
     box-shadow: 0 0 8px rgba(255, 209, 102, 0.65);
 }
 .hiro-brand {
-    color: rgba(255, 255, 255, 0.58);
-    font-size: 10px;
+    /* GTK's brand uses letter-spacing: 3px, but St/ClutterText under-sizes
+       letter-spaced labels on some shell versions and ellipsizes the last
+       glyphs ("HI…"), so the tracking is omitted here. */
+    color: #768390;
+    font-size: 11px;
     font-weight: bold;
 }
 .hiro-status-box {
-    spacing: 15px;
+    spacing: 18px;
     padding: 0 3px;
 }
 .hiro-status-label {
-    font-size: 18px;
+    font-size: 20px;
     font-weight: bold;
 }
 .hiro-status-meter {
-    spacing: 6px;
-}
-.hiro-meter-row {
     spacing: 8px;
 }
+.hiro-meter-row {
+    spacing: 10px;
+}
 .hiro-meter-caption {
-    font-size: 12px;
+    font-size: 13px;
     color: #d5d5d5;
     text-align: left;
 }
 .hiro-meter-track {
     background-color: rgba(255, 255, 255, 0.18);
-    border-radius: 3px;
+    border-radius: 4px;
 }
 .hiro-meter-fill {
-    border-radius: 3px;
+    border-radius: 4px;
 }
 .hiro-meter-fill-var {
     background-color: #ffd166;
@@ -59,7 +62,7 @@
     background-color: #66bb6a;
 }
 .hiro-status-hint {
-    font-size: 13px;
+    font-size: 14px;
     color: #ffd166;
     text-align: center;
 }
@@ -96,13 +99,13 @@
     padding-top: 4px;
 }
 .hiro-approval-title {
-    font-size: 15px;
+    font-size: 17px;
     font-weight: bold;
     color: #ffffff;
     text-align: center;
 }
 .hiro-approval-sub {
-    font-size: 13px;
+    font-size: 14px;
     color: #ffd166;
     text-align: center;
 }
@@ -112,9 +115,9 @@
     padding-bottom: 4px;
 }
 .hiro-approval-btn {
-    padding: 7px 22px;
-    border-radius: 16px;
-    font-size: 14px;
+    padding: 9px 26px;
+    border-radius: 18px;
+    font-size: 15px;
     font-weight: bold;
 }
 .hiro-approval-allow {
