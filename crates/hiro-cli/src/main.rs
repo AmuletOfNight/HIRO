@@ -57,8 +57,6 @@ enum Command {
         #[arg(long, default_value = "hiro-test")]
         service: String,
     },
-    /// Capture one frame to a PGM file (debug aid).
-    Snapshot { path: PathBuf },
     /// Manage the sealed login password used to unlock the keyring on face
     /// login (see `hiro keyring set`).
     Keyring {
@@ -236,16 +234,6 @@ fn main() {
                 }
             })
         }
-        Command::Snapshot { path } => match client.call(Op::Snapshot {
-            path: path.display().to_string(),
-        }) {
-            Ok(ResultValue::Snapshot { path }) => {
-                println!("wrote {path} (PGM; convert with `magick {path} out.png`)");
-                Ok(())
-            }
-            Ok(_) => Err("unexpected daemon response".into()),
-            Err(e) => Err(e),
-        },
         Command::Keyring { cmd } => {
             match cmd {
                 KeyringCmd::Set { user } => {

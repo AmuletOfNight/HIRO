@@ -5,9 +5,10 @@ hiro \- enroll and manage face templates for HIRO authentication
 .B hiro
 [\fB\-\-socket\fR \fIPATH\fR] \fICOMMAND\fR [\fIOPTIONS\fR]
 .SH DESCRIPTION
-HIRO provides Windows Hello-style face authentication on Linux using the
-built-in IR camera. \fBhiro\fR talks to the \fBhirod\fR(8) daemon to enroll,
-test, and manage encrypted face templates.
+HIRO ("Hello, InfraRed, On Linux") provides Windows Hello-style face
+authentication on Linux using the built-in IR camera. \fBhiro\fR talks to
+the \fBhirod\fR(8) daemon to enroll, test, and manage encrypted face
+templates.
 .SH COMMANDS
 .TP
 .B enroll [USER] [--max N]
@@ -47,9 +48,6 @@ Drop the sealed keyring password.
 .TP
 .B keyring status [USER]
 Show whether keyring unlock is enabled and a password is stored.
-.TP
-.B snapshot PATH
-Capture one frame to a PGM file (debug aid).
 .TP
 .B doctor
 Run hardware diagnostics: camera discovery, IR detection, emitter support,

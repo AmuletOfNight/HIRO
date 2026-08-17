@@ -723,6 +723,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tss-esapi",
+ "zeroize",
 ]
 
 [[package]]
@@ -744,6 +745,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

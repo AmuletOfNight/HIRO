@@ -223,6 +223,18 @@ pub fn usb_identity(bus_info: &str, video_path: &Path) -> CameraIdentity {
     identity
 }
 
+/// The canonical sysfs device path for a V4L2 node, e.g.
+/// `/sys/devices/pci0000:00/.../1-5:1.0/video4linux/video0`. Resolved from
+/// `/sys/class/video4linux/videoN/device`. USB descriptors cannot influence
+/// this path, so it is a strong component of the camera-pinning binding.
+pub fn sysfs_device_path(video_path: &Path) -> Option<String> {
+    let name = video_path.file_name()?;
+    let class = PathBuf::from("/sys/class/video4linux").join(name).join("device");
+    std::fs::canonicalize(&class)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Human-readable summary of all probes; used by `hiro doctor`.
 pub fn summarize(probes: &[CameraProbe]) -> String {
     let mut out = String::new();

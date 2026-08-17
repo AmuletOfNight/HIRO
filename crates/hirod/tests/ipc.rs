@@ -138,7 +138,7 @@ fn arm_login_over_socket(client: &mut Client, socket: &std::path::Path, user: &s
 
 #[test]
 fn full_cycle_over_socket() {
-    let (daemon, dir) = build_daemon();
+    let (daemon, _dir) = build_daemon();
     let socket = daemon.cfg.read().unwrap().daemon.socket_path.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -243,26 +243,6 @@ fn full_cycle_over_socket() {
             result: ResultValue::Status(_)
         }
     ));
-
-    // Snapshot writes a PGM.
-    let shot = dir.path().join("shot.pgm");
-    let resp = client.call(
-        &socket,
-        Op::Snapshot {
-            path: shot.display().to_string(),
-        },
-    );
-    assert!(matches!(
-        resp.outcome,
-        Outcome::Ok {
-            result: ResultValue::Snapshot { .. }
-        }
-    ));
-    let data = std::fs::read_to_string(&shot).unwrap();
-    assert!(
-        data.starts_with("P5\n"),
-        "expected PGM header, got {data:?}"
-    );
 
     shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     server_thread.join().unwrap();
@@ -577,11 +557,22 @@ fn keyring_flow_over_socket() {
             result: ResultValue::Verify(v),
         } => {
             assert!(v.matched, "verify failed: {v:?}");
-            assert_eq!(
-                v.keyring_password.as_deref(),
-                Some("login-password"),
-                "sealed password should be released on a match"
-            );
+            // The sealed login password is released only to root callers
+            // (greeter/login stacks). A same-uid process — even one asking
+            // on a listed service — must never receive it: that is the
+            // silent-harvesting hole this hardening closes.
+            if nix::unistd::geteuid().is_root() {
+                assert_eq!(
+                    v.keyring_password.as_deref(),
+                    Some("login-password"),
+                    "root callers should receive the sealed password on a listed service"
+                );
+            } else {
+                assert!(
+                    v.keyring_password.is_none(),
+                    "same-uid callers must never receive the login password"
+                );
+            }
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -884,6 +875,7 @@ fn approval_grant_and_deny_over_socket() {
             approval_id,
             user: user.clone(),
             allow: true,
+            secret: None,
         },
     );
     assert!(
@@ -915,6 +907,7 @@ fn approval_grant_and_deny_over_socket() {
             approval_id,
             user: user.clone(),
             allow: false,
+            secret: None,
         },
     );
     assert!(matches!(
@@ -1017,6 +1010,7 @@ fn approve_requires_authorization_over_socket() {
             approval_id: approval_id + 10_000,
             user: user.clone(),
             allow: true,
+            secret: None,
         },
     );
     assert!(matches!(resp.outcome, Outcome::Err { .. }));
@@ -1029,6 +1023,7 @@ fn approve_requires_authorization_over_socket() {
             approval_id,
             user: "root".into(),
             allow: true,
+            secret: None,
         },
     );
     assert!(matches!(resp.outcome, Outcome::Err { .. }));
@@ -1040,6 +1035,7 @@ fn approve_requires_authorization_over_socket() {
             approval_id,
             user: user.clone(),
             allow: true,
+            secret: None,
         },
     );
     assert!(matches!(
@@ -1056,6 +1052,109 @@ fn approve_requires_authorization_over_socket() {
     }
     drop(stream);
 
+    env.shutdown
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    env.server_thread.join().unwrap();
+}
+
+/// H-3: with `approval.secure_desktop`, a decision may only come from the
+/// root-owned dialog that was given the per-approval secret. A same-uid
+/// caller is rejected even if it somehow knew the secret; a root caller is
+/// rejected without it.
+#[test]
+fn secure_approval_requires_root_and_secret() {
+    let env = start_approval_env(800);
+    {
+        let mut cfg = env.daemon.cfg.write().unwrap();
+        cfg.approval.secure_desktop = true;
+        // Point the dialog spawn at a path that cannot exist so the test
+        // never actually switches VTs or launches a helper.
+        cfg.approval.secure_dialog = "/nonexistent/hiro-approve".into();
+    }
+    let socket = env.socket.clone();
+    let user = env.user.clone();
+
+    let (stream, mut reader) = open_watch(&socket);
+    let vt = verify_in_background(&socket, &user, "ipc-sudo");
+    let ev = wait_for_approval(&mut reader);
+    let approval_id = ev["approval_id"].as_u64().expect("approval_id");
+    assert_eq!(ev["secure"].as_bool(), Some(true));
+
+    // Read the per-approval secret from the daemon's own state. A real
+    // same-uid attacker cannot read the root dialog's argv; the test can
+    // because it holds the daemon handle.
+    let secret = {
+        let approvals = env.daemon.approvals.lock().unwrap();
+        approvals
+            .get(&approval_id)
+            .expect("pending approval")
+            .secret
+            .clone()
+            .expect("secure approval must carry a secret")
+    };
+
+    let mut decider = Client::new();
+    if nix::unistd::geteuid().is_root() {
+        // Root + correct secret: the decision is accepted.
+        let resp = decider.call(
+            &socket,
+            Op::Approve {
+                approval_id,
+                user: user.clone(),
+                allow: true,
+                secret: Some(secret),
+            },
+        );
+        assert!(
+            matches!(resp.outcome, Outcome::Ok { .. }),
+            "root + secret should approve: {:?}",
+            resp.outcome
+        );
+        // Root without the secret is rejected.
+        let resp = decider.call(
+            &socket,
+            Op::Approve {
+                approval_id,
+                user: user.clone(),
+                allow: true,
+                secret: None,
+            },
+        );
+        assert!(matches!(resp.outcome, Outcome::Err { .. }));
+    } else {
+        // A same-uid (non-root) caller is rejected even with the secret.
+        let resp = decider.call(
+            &socket,
+            Op::Approve {
+                approval_id,
+                user: user.clone(),
+                allow: true,
+                secret: Some(secret),
+            },
+        );
+        assert!(
+            matches!(resp.outcome, Outcome::Err { .. }),
+            "non-root callers must never decide secure approvals: {:?}",
+            resp.outcome
+        );
+        // And without it.
+        let resp = decider.call(
+            &socket,
+            Op::Approve {
+                approval_id,
+                user: user.clone(),
+                allow: true,
+                secret: None,
+            },
+        );
+        assert!(matches!(resp.outcome, Outcome::Err { .. }));
+    }
+
+    // Whether or not the decision landed, the parked request resolves
+    // (immediately, or via the 800 ms window expiring).
+    let _ = vt.join().unwrap();
+
+    drop(stream);
     env.shutdown
         .store(true, std::sync::atomic::Ordering::Relaxed);
     env.server_thread.join().unwrap();

@@ -52,10 +52,6 @@ pub enum Op {
     Clear {
         user: String,
     },
-    /// Capture one frame and write it (PNG) to the given path. Debug aid.
-    Snapshot {
-        path: String,
-    },
     /// Seal and store the login password for `user` (keyring unlock).
     KeyringSet {
         user: String,
@@ -96,6 +92,12 @@ pub enum Op {
         user: String,
         /// `true` allows the action, `false` denies it.
         allow: bool,
+        /// Per-approval secret for approvals rendered on the secure console
+        /// (`approval.secure_desktop`): only the root-owned `hiro-approve`
+        /// dialog that was given the secret may decide. In-session prompts
+        /// (and the GNOME Shell extension) leave this unset.
+        #[serde(default)]
+        secret: Option<String>,
     },
 }
 
@@ -152,9 +154,6 @@ pub enum ResultValue {
     },
     Cleared {
         count: usize,
-    },
-    Snapshot {
-        path: String,
     },
     KeyringSet {
         stored: bool,
@@ -480,12 +479,12 @@ mod tests {
         let json = serde_json::to_string(&Request {
             v: 1,
             id: 1,
-            op: Op::Snapshot {
-                path: "/tmp/x.png".into(),
+            op: Op::Clear {
+                user: "alice".into(),
             },
         })
         .unwrap();
-        assert!(json.contains("\"op\":\"snapshot\""), "unexpected: {json}");
+        assert!(json.contains("\"op\":\"clear\""), "unexpected: {json}");
     }
 
     #[test]
@@ -530,35 +529,54 @@ mod tests {
                 approval_id: 77,
                 user: "alice".into(),
                 allow: true,
+                secret: Some("0123456789abcdef0123456789abcdef".into()),
             },
         })
         .unwrap();
         assert!(json.contains("\"op\":\"approve\""), "{json}");
         assert!(json.contains("\"approval_id\":77"), "{json}");
+        assert!(json.contains("\"secret\":\"0123456789abcdef0123456789abcdef\""), "{json}");
         let back: Request = serde_json::from_str(&json).unwrap();
         match back.op {
             Op::Approve {
                 approval_id,
                 user,
                 allow,
+                secret,
             } => {
                 assert_eq!(approval_id, 77);
                 assert_eq!(user, "alice");
                 assert!(allow);
+                assert_eq!(
+                    secret.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef")
+                );
             }
             _ => panic!("wrong op"),
         }
+    }
 
-        let resp = Response::ok(11, ResultValue::Approved);
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"type\":\"approved\""), "{json}");
-        let back: Response = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            back.outcome,
-            Outcome::Ok {
-                result: ResultValue::Approved
+    /// The in-session GNOME Shell indicator sends `Op::Approve` without the
+    /// `secret` field (only the root-owned secure dialog knows the secret).
+    /// The daemon must accept that request and default the secret to None.
+    #[test]
+    fn approve_without_secret_field_parses() {
+        let json = r#"{"v":2,"id":0,"op":"approve","approval_id":7,"user":"alice","allow":true}"#;
+        let back: Request = serde_json::from_str(json).unwrap();
+        match back.op {
+            Op::Approve {
+                approval_id,
+                user,
+                allow,
+                secret,
+            } => {
+                assert_eq!(approval_id, 7);
+                assert_eq!(user, "alice");
+                assert!(allow);
+                assert_eq!(secret, None);
             }
-        ));
+            _ => panic!("wrong op"),
+        }
     }
 
     #[test]

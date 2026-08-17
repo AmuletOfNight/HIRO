@@ -49,6 +49,16 @@ struct Args {
     approval_id: u64,
     service: String,
     timeout_ms: u64,
+    /// Per-approval secret from `hirod`: required so `Op::Approve` accepts
+    /// this dialog's decision (only the root-owned dialog knows it).
+    secret: Option<String>,
+}
+
+/// Strip control characters (terminal escape sequences, C0/C1, DEL) so a
+/// caller-supplied service or user name can never inject escape sequences
+/// into the "secure" console's rendering.
+fn sanitize_ctl(s: &str) -> String {
+    s.chars().filter(|&c| !c.is_control()).collect()
 }
 
 fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
@@ -59,6 +69,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
         approval_id: 0,
         service: "unknown".into(),
         timeout_ms: 5_000,
+        secret: None,
     };
     for arg in args {
         let Some((key, value)) = arg.split_once('=') else {
@@ -71,18 +82,19 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
                     .map_err(|_| format!("bad --vt value: {value}"))?
             }
             "--socket" => out.socket = value.into(),
-            "--user" => out.user = value.into(),
+            "--user" => out.user = sanitize_ctl(value),
             "--approval-id" => {
                 out.approval_id = value
                     .parse()
                     .map_err(|_| format!("bad --approval-id value: {value}"))?
             }
-            "--service" => out.service = value.into(),
+            "--service" => out.service = sanitize_ctl(value),
             "--timeout-ms" => {
                 out.timeout_ms = value
                     .parse()
                     .map_err(|_| format!("bad --timeout-ms value: {value}"))?
             }
+            "--secret" => out.secret = Some(value.into()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -100,7 +112,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("hiro-approve: {e}");
-            eprintln!("usage: hiro-approve --vt=N --user=U --approval-id=N [--socket=PATH] [--service=S] [--timeout-ms=N]");
+            eprintln!("usage: hiro-approve --vt=N --user=U --approval-id=N [--socket=PATH] [--service=S] [--timeout-ms=N] [--secret=HEX]");
             std::process::exit(2);
         }
     };
@@ -143,9 +155,10 @@ fn run(args: &Args) -> i32 {
     };
 
     // Watch the daemon's state stream so a daemon-side resolution (timeout
-    // or the user leaving the frame) closes the dialog promptly.
+    // or the user leaving the frame) closes the dialog promptly. Only
+    // events for this approval (and user) can dismiss the dialog.
     let (tx, rx) = mpsc::channel::<WatchMsg>();
-    let watcher = spawn_watcher(&args.socket, tx);
+    let watcher = spawn_watcher(&args.socket, &args.user, args.approval_id, tx);
 
     let start = Instant::now();
     let mut exit_code: Option<i32> = None;
@@ -502,12 +515,22 @@ enum WatchMsg {
     Unreachable,
 }
 
-/// Follow the daemon's state stream and report when the approval window
+/// Follow the daemon's state stream and report when *this* approval window
 /// closes so the dialog can exit instead of counting down on a resolved
 /// request. Also reports when the user steps away so the prompt does not
 /// sit on a deserted secure console.
-fn spawn_watcher(socket: &str, tx: mpsc::Sender<WatchMsg>) -> std::thread::JoinHandle<()> {
+///
+/// Events for other approvals/users are ignored, so a concurrent request
+/// (even from another session or user) can neither dismiss nor spoof this
+/// dialog.
+fn spawn_watcher(
+    socket: &str,
+    user: &str,
+    approval_id: u64,
+    tx: mpsc::Sender<WatchMsg>,
+) -> std::thread::JoinHandle<()> {
     let socket = socket.to_string();
+    let user = user.to_string();
     std::thread::spawn(move || {
         let mut stream = match UnixStream::connect(&socket) {
             Ok(s) => s,
@@ -552,6 +575,15 @@ fn spawn_watcher(socket: &str, tx: mpsc::Sender<WatchMsg>) -> std::thread::JoinH
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            // Ignore everything that does not belong to this approval.
+            if ev.approval_id.is_some() && ev.approval_id != Some(approval_id) {
+                continue;
+            }
+            if let Some(u) = &ev.user {
+                if *u != user {
+                    continue;
+                }
+            }
             if ev.user_present == Some(false) {
                 // The user stepped away; dismiss the dialog (hirod re-opens
                 // it if they come back).
@@ -580,6 +612,8 @@ fn send_approve(args: &Args, allow: bool) -> bool {
             approval_id: args.approval_id,
             user: args.user.clone(),
             allow,
+            // Secure approvals require root + this per-approval secret.
+            secret: args.secret.clone(),
         },
     };
     let mut line = match serde_json::to_string(&req) {
@@ -677,6 +711,7 @@ mod tests {
                 "--approval-id=42".to_string(),
                 "--service=sudo".to_string(),
                 "--timeout-ms=3000".to_string(),
+                "--secret=0123456789abcdef0123456789abcdef".to_string(),
             ]
             .into_iter(),
         )
@@ -687,6 +722,36 @@ mod tests {
         assert_eq!(args.approval_id, 42);
         assert_eq!(args.service, "sudo");
         assert_eq!(args.timeout_ms, 3000);
+        assert_eq!(
+            args.secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn sanitizes_terminal_control_from_service_and_user() {
+        let args = parse_args(
+            vec![
+                "--user=alice\u{1b}[2J".to_string(),
+                "--approval-id=1".to_string(),
+                "--service=sudo\u{1b}[31mHACKED\u{1b}[0m".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        // Every control byte (the ESC that starts escape sequences) must be
+        // gone; printable text is preserved as-is.
+        assert!(
+            args.user.chars().all(|c| !c.is_control()),
+            "user retains control chars: {:?}",
+            args.user
+        );
+        assert!(
+            args.service.chars().all(|c| !c.is_control()),
+            "service retains control chars: {:?}",
+            args.service
+        );
+        assert!(!args.service.contains('\u{1b}'));
     }
 
     #[test]
@@ -725,6 +790,7 @@ mod tests {
             approval_id: 42,
             service: "sudo".into(),
             timeout_ms: 5_000,
+            secret: None,
         }
     }
 
@@ -814,7 +880,7 @@ mod tests {
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
             if c == '\x1b' {
-                while let Some(n) = chars.next() {
+                for n in chars.by_ref() {
                     if n.is_ascii_alphabetic() {
                         break;
                     }

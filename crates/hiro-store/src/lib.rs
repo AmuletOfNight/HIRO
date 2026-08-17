@@ -55,6 +55,12 @@ impl Store {
             })?;
         }
         let conn = Connection::open(path)?;
+        // The database contains encrypted templates, audit events, and the
+        // sealed keyring password. The parent directory is expected to be
+        // root-only, but lock the file to 0600 as defence in depth so a
+        // stray copy or a lax directory never exposes it.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         let store = Self { conn };
         store.init()?;
         Ok(store)
@@ -134,6 +140,11 @@ impl Store {
         if !cols.iter().any(|c| c == "match_threshold") {
             self.conn
                 .execute_batch("ALTER TABLE users ADD COLUMN match_threshold REAL")
+                .map_err(StoreError::Db)?;
+        }
+        if !cols.iter().any(|c| c == "camera_secret") {
+            self.conn
+                .execute_batch("ALTER TABLE users ADD COLUMN camera_secret BLOB")
                 .map_err(StoreError::Db)?;
         }
         Ok(())
@@ -302,6 +313,45 @@ impl Store {
             .flatten())
     }
 
+    /// Persist the per-user camera-pinning secret generated at enrollment
+    /// (`None` removes it). Together with `camera_fingerprint` this marks
+    /// the pinning record as genuine; verification fails closed unless both
+    /// are present.
+    pub fn set_camera_secret(&self, user_name: &str, secret: Option<&[u8]>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE users SET camera_secret = ?1 WHERE name = ?2",
+            params![secret, user_name],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::UserNotFound(user_name.into()));
+        }
+        Ok(())
+    }
+
+    /// Drop the per-user camera-pinning record (binding + secret). Used by
+    /// `hiro clear` so removing all templates also clears the pin and
+    /// re-enrollment starts fresh. A no-op for unknown users.
+    pub fn clear_camera_binding(&self, user_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE users SET camera_fingerprint = NULL, camera_secret = NULL WHERE name = ?1",
+            params![user_name],
+        )?;
+        Ok(())
+    }
+
+    /// The per-user camera-pinning secret, if one was recorded.
+    pub fn camera_secret(&self, user_name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT camera_secret FROM users WHERE name = ?1",
+                params![user_name],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Store the sealed login password for a user (`None` removes it).
     /// The value is always the AES-256-GCM ciphertext from a `KeyManager`,
     /// never a plaintext secret.
@@ -449,6 +499,21 @@ mod tests {
             s.camera_fingerprint("alice").unwrap().unwrap(),
             "13d3:56ea:usb-x:?"
         );
+    }
+
+    #[test]
+    fn camera_pin_secret_roundtrip_and_clear() {
+        let s = store();
+        s.upsert_user("alice", Some(1000)).unwrap();
+        assert!(s.camera_secret("alice").unwrap().is_none());
+        s.set_camera_fingerprint("alice", "13d3:56ea:uvcvideo:/sys/x").unwrap();
+        s.set_camera_secret("alice", Some(&[7u8; 32])).unwrap();
+        assert_eq!(s.camera_secret("alice").unwrap().unwrap(), vec![7u8; 32]);
+        s.clear_camera_binding("alice").unwrap();
+        assert!(s.camera_fingerprint("alice").unwrap().is_none());
+        assert!(s.camera_secret("alice").unwrap().is_none());
+        // Unknown users are a no-op.
+        s.clear_camera_binding("nobody").unwrap();
     }
 
     #[test]

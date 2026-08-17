@@ -198,6 +198,14 @@ install -Dm755 "$REPO/scripts/fetch-models.sh"               /usr/share/hiro/fet
 install -Dm644 "$REPO/crates/hiro-face/models/manifest.toml" /usr/share/hiro/models/manifest.toml
 
 # --- one-time data initialization ------------------------------------------
+if ! getent group hiro >/dev/null 2>&1; then
+    echo "== creating the 'hiro' group (camera access for hiro doctor) =="
+    if command -v groupadd >/dev/null 2>&1; then
+        groupadd --system hiro
+    elif command -v addgroup >/dev/null 2>&1; then
+        addgroup --system hiro
+    fi
+fi
 if [ ! -e /var/lib/hiro/hiro.key ]; then
     echo "== initializing keys and database (hirod --init-keys) =="
     mkdir -p /var/lib/hiro

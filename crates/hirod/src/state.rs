@@ -1,8 +1,8 @@
 //! Shared daemon state.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::Sender;
+use std::io::Read;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -13,7 +13,7 @@ use hiro_store::Store;
 use hiro_tpm::KeyManager;
 
 use crate::camera::CameraSession;
-use crate::policy::Policy;
+use crate::policy::{Caller, Policy};
 
 /// Checks whether a plaintext password is the current login password for a
 /// user. The production implementation consults `/etc/shadow` via
@@ -54,6 +54,13 @@ pub struct PendingApproval {
     /// `None` until the user (or their status indicator) decides via
     /// `Op::Approve`; then `Some(allow)`.
     pub decided: Option<bool>,
+    /// Per-approval secret for secure-desktop (root-rendered) approvals.
+    /// `Some` only when `approval.secure_desktop` is enabled: the daemon
+    /// passes it to the root-owned `hiro-approve` dialog, and `Op::Approve`
+    /// is only honoured when the caller is root *and* presents the secret.
+    /// In-session approvals leave this `None` (the prompt itself lives in
+    /// the user's session, so the decision is made by the session).
+    pub secret: Option<String>,
     pub created: Instant,
 }
 
@@ -69,20 +76,70 @@ pub struct Daemon {
     /// Verifies a candidate login password against the account (used for
     /// keyring unlock release).
     pub password_checker: Box<dyn PasswordChecker>,
-    /// Subscribers to authentication state events (`Op::Watch`).
-    pub watchers: Mutex<Vec<Sender<String>>>,
+    /// Subscribers to authentication state events (`Op::Watch`). Each
+    /// watcher carries its SO_PEERCRED caller so broadcasts can be filtered
+    /// to the caller's own user (privacy), and uses a bounded channel so a
+    /// stalled watcher is dropped instead of growing the daemon's memory.
+    pub watchers: Mutex<Vec<Watcher>>,
     /// Users who have logged in since the last reboot (after-reboot gate).
     pub boot_auth: Mutex<BootAuth>,
     /// Pending action approvals awaiting an Allow/Disallow decision, keyed
     /// by approval id (`Op::Approve`).
     pub approvals: Mutex<HashMap<u64, PendingApproval>>,
-    /// Monotonic source of approval ids.
-    pub next_approval_id: AtomicU64,
     pub config_path: Option<std::path::PathBuf>,
     pub started_at: std::time::Instant,
 }
 
 pub type SharedDaemon = Arc<Daemon>;
+
+/// One `Op::Watch` subscriber: the caller identity (for per-user event
+/// filtering) and its bounded event channel.
+pub struct Watcher {
+    pub caller: Caller,
+    pub tx: SyncSender<String>,
+}
+
+/// How many pending events a watcher may buffer before it is considered
+/// too slow and dropped. Scanning/enrollment broadcast a few events per
+/// second; 64 comfortably covers the burst while bounding memory.
+pub const WATCH_BUFFER: usize = 64;
+
+/// Fill `buf` from the kernel CSPRNG. `/dev/urandom` is always available on
+/// Linux; if a read ever fails the buffer stays zeroed.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf
+}
+
+/// A random 64-bit value (not guessable from a counter).
+pub fn random_u64() -> u64 {
+    u64::from_ne_bytes(random_bytes()).max(1)
+}
+
+/// A random approval id in `[1, 2^32)`.
+///
+/// The daemon broadcasts `approval_id` to the GNOME Shell indicator, which
+/// parses JSON numbers as IEEE doubles — only integers below 2^53 are
+/// exact there. A full 64-bit random id would be rounded by the extension
+/// and echoed back wrong, breaking the approve round-trip. 32 random bits
+/// are still unpredictable (no counter-based guessing) while remaining
+/// exactly representable in JS.
+pub fn random_approval_id() -> u64 {
+    u64::from(u32::from_ne_bytes(random_bytes::<4>())).max(1)
+}
+
+/// A random per-approval secret for secure-console dialogs (32 hex chars).
+pub fn random_secret() -> String {
+    let mut s = String::with_capacity(32);
+    for b in random_bytes::<16>() {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 
 /// Broadcast a state event to all `Op::Watch` subscribers.
 pub fn broadcast_state(daemon: &SharedDaemon, event: &hiro_core::proto::StateEvent) {
@@ -100,7 +157,21 @@ pub fn broadcast_state(daemon: &SharedDaemon, event: &hiro_core::proto::StateEve
         Ok(w) => w,
         Err(_) => return,
     };
-    watchers.retain(|tx| tx.send(line.clone()).is_ok());
+    watchers.retain(|w| {
+        // Root watchers see every event; non-root watchers only see events
+        // for their own user (plus user-less "idle" broadcasts). This stops
+        // any local process from monitoring other users' auth activity.
+        if !w.caller.is_root() {
+            if let Some(user) = &event.user {
+                if crate::lookup::uid_of(user) != Some(w.caller.uid) {
+                    return true; // keep the watcher, skip this event
+                }
+            }
+        }
+        // Bounded channel: a watcher that stops reading is dropped rather
+        // than growing the daemon's memory without bound.
+        w.tx.try_send(line.clone()).is_ok()
+    });
 }
 
 /// Overrides used by tests (mock camera, stub pipeline, temp storage).
@@ -162,7 +233,6 @@ impl Daemon {
             watchers: Mutex::new(Vec::new()),
             boot_auth: Mutex::new(BootAuth { boot_id, logged_in }),
             approvals: Mutex::new(HashMap::new()),
-            next_approval_id: AtomicU64::new(1),
             config_path: opts.config_path,
             started_at: std::time::Instant::now(),
         }))
@@ -198,5 +268,35 @@ impl Daemon {
             .update_cfg(new_cfg.security);
         log::info!("configuration reloaded");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_ids_are_js_safe() {
+        // The GNOME Shell indicator parses approval_id as an IEEE double:
+        // values at or above 2^53 are rounded and break the approve
+        // round-trip. Approval ids must stay below that and never be 0.
+        for _ in 0..1000 {
+            let id = random_approval_id();
+            assert!(id >= 1, "approval id must be positive: {id}");
+            assert!(
+                id < 1u64 << 53,
+                "approval id must be exactly representable in JS: {id}"
+            );
+            assert!(id <= u64::from(u32::MAX), "approval id out of range: {id}");
+        }
+    }
+
+    #[test]
+    fn approval_ids_are_not_predictable() {
+        // Two consecutive approvals should not share an id (overwhelmingly
+        // likely for 32 random bits; flaky odds are ~1/2^32).
+        let a = random_approval_id();
+        let b = random_approval_id();
+        assert_ne!(a, b);
     }
 }

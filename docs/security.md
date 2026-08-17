@@ -1,7 +1,8 @@
 # Security model
 
-HIRO is built as a hardened authenticator, not a convenience unlocker. The
-reference bar is Windows Hello: spoof-resistant, IR-based, hardware-bound.
+HIRO ("Hello, InfraRed, On Linux") is built as a hardened authenticator,
+not a convenience unlocker. The reference bar is Windows Hello:
+spoof-resistant, IR-based, hardware-bound.
 
 ## Threat model
 
@@ -77,10 +78,22 @@ their own threshold:
 
 ### Camera pinning
 
-Enrollment records the camera's USB identity (vendor/product/bus/serial).
-Verification on a different camera is refused unless the admin explicitly
-sets `security.allow_camera_change` and re-enrolls. This defeats USB
-injection attacks against the verification path.
+Enrollment records a camera **binding**: the USB identity
+(vendor/product/bus/serial), the kernel driver, and the canonical sysfs
+device path, plus a per-user random pin secret. USB descriptors cannot
+influence the driver or sysfs path components, and the pin secret marks
+the record as a genuine enrollment. Verification on a different camera —
+or against an enrollment that lacks either the binding or the pin secret —
+is refused unless the admin explicitly sets `security.allow_camera_change`
+and re-enrolls. This defeats USB injection attacks against the
+verification path.
+
+Note for upgrades: enrollments created before the pin secret was recorded
+are treated as unpinned — verification fails closed (a clean non-match,
+password fallback) until the user re-enrolls. Enrollment itself does not
+lock the user out: a record without a pin secret is simply re-pinned on
+the next `hiro enroll`. `hiro clear` now drops the camera pin along with
+the templates, so "clear then re-enroll" always starts fresh.
 
 ### Template confidentiality
 
@@ -120,6 +133,12 @@ injection attacks against the verification path.
   caller identity via `SO_PEERCRED`.
 - A caller may authenticate only for themselves; root may act for anyone
   (greeter workers run as root, lock screens as the user).
+- Administrative operations are root-only: `reload` (re-reads
+  configuration and can rebuild the recognition pipeline) and `prewarm`
+  (acquires the camera / toggles the IR emitter).
+- `watch` streams are filtered by caller: root sees all events, everyone
+  else only their own user's, so no local process can monitor other
+  users' authentication activity.
 - The daemon is the only component that touches the camera, models, key,
   and templates.
 
@@ -177,6 +196,17 @@ silently just because the camera recognizes the user.
   when the daemon reports the user stepped away (`user_present: false`);
   `hirod` re-opens it if the user steps back into the frame before the
   window expires.
+- The secure-console decision is **root-gated**: each secure approval gets
+  a fresh random secret that only `hirod` and the spawned root-owned
+  `hiro-approve` dialog know, and `Op::Approve` is honoured only when the
+  caller is root *and* presents that secret. A compromised session — even
+  one that can watch the approval events — cannot decide; it can only see
+  the prompt and wait. (Non-root processes cannot read a root process's
+  argv, so the secret on the dialog's command line stays private.) With
+  the in-session prompt (`secure_desktop` off), the decision lives in the
+  user's session by design, so any process running as that user can click
+  Allow — that is inherent to rendering the prompt in the session, and is
+  why `secure_desktop` exists for the strong guarantee.
 
 ### After-reboot password gate
 
@@ -218,10 +248,14 @@ and mitigations:
   compare) *before* releasing it to `pam_hiro.so`. A stale or mistyped
   secret is never released, so a changed password cannot break face login;
   it only leaves the keyring locked until the user re-enrolls.
-- The password is released only when the caller is authorized
-  (root, or the target user themselves), the face matched, the service is
-  listed in `keyring.services`, and the client asked for it
-  (`pam_hiro.so keyring`).
+- The password is released only when the caller is **root** (greeter and
+  login stacks run as root), the face matched, the service is listed in
+  `keyring.services`, and the client asked for it (`pam_hiro.so keyring`).
+  Restricting release to root closes the silent-harvesting hole where a
+  process running as the user could ask for the login password and receive
+  it the moment the user's face was in front of the camera — the daemon
+  cannot distinguish a real greeter from same-uid malware, so same-uid
+  callers never receive it.
 - Release and refusal are both audited (`keyring_unlock` events).
 - Trade-off: anyone who can pass face auth for a user can unlock that
   user's keyring. That is the feature's purpose; disabling `[keyring]`

@@ -65,10 +65,11 @@ After `configure`, HIRO's emitter fallback runs
 camera start.
 
 If neither works, IR frames stay nearly black and enrollment will time
-out. Test directly:
+out. Test directly with `hiro doctor` (camera + IR detection) and, if you
+need a raw frame for inspection, read the node as root:
 
 ```bash
-hiro snapshot /tmp/ir.pgm && magick /tmp/ir.pgm /tmp/ir.png
+sudo v4l2-ctl -d /dev/video0 --stream-mmap --stream-to=/tmp/ir.raw --stream-count=1
 ```
 
 A correct IR frame shows a bright, high-contrast face with the emitter

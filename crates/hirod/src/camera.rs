@@ -72,11 +72,18 @@ impl CameraSession {
             }
         };
         if self.require_ir && !picked.is_ir_candidate {
-            log::warn!(
-                "configured device {} does not look IR-capable ({})",
+            // Hard refusal, not a warning: the IR-only rule is the primary
+            // anti-screen-replay control. A non-IR node must never serve
+            // authentication; the session is left without a source so every
+            // acquire() fails cleanly (camera_unavailable, password fallback).
+            log::error!(
+                "refusing to use {} for authentication: require_ir is set but the device \
+                 is not IR-capable ({})",
                 picked.path,
                 picked.why_ir
             );
+            self.probe = Some(picked.clone());
+            return;
         }
         self.probe = Some(picked.clone());
         match V4lSource::new(&picked.path, self.width, self.height, self.fps, self.fourcc) {

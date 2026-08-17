@@ -1,4 +1,8 @@
-# HIRO: grant the video group access to camera nodes. The daemon runs as
-# root, but `hiro doctor` and enrollment previews benefit from group access
-# for regular users.
-SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"
+# HIRO: grant the dedicated 'hiro' group access to camera nodes so members
+# can run non-root diagnostics (`hiro doctor`) and enrollment previews.
+# Members of the general 'video' group are NOT granted camera access —
+# cameras are sensitive (the IR node captures the user's face), and a
+# device held open by another process would contend with the daemon.
+#
+# Add users with:  sudo usermod -aG hiro $USER
+SUBSYSTEM=="video4linux", GROUP="hiro", MODE="0660"

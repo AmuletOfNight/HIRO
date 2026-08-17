@@ -27,13 +27,16 @@ use tss_esapi::structures::{
 use tss_esapi::tcti_ldr::TctiNameConf;
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::Context;
+use zeroize::Zeroizing;
 
 use crate::{aead_seal, aead_unseal, fill_random, write_keyfile, KeyManager};
 
 pub const SEALED_VERSION_BYTE: u8 = 0x01;
 
 pub struct TpmKeyManager {
-    key: [u8; 32],
+    /// The unsealed data key. Wrapped in `Zeroizing` so the in-memory key
+    /// is wiped when the manager is dropped.
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl TpmKeyManager {
@@ -46,7 +49,9 @@ impl TpmKeyManager {
             ))
         })?;
         let key = unseal_key_from_blob(&blob)?;
-        Ok(Self { key })
+        Ok(Self {
+            key: Zeroizing::new(key),
+        })
     }
 
     /// Generate a fresh AES key, seal it under the TPM, and write the blob
@@ -56,17 +61,19 @@ impl TpmKeyManager {
         fill_random(&mut key);
         let blob = seal_key_to_blob(&key)?;
         write_keyfile(path, &blob)?;
-        Ok(Self { key })
+        Ok(Self {
+            key: Zeroizing::new(key),
+        })
     }
 }
 
 impl KeyManager for TpmKeyManager {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        aead_seal(&self.key, plaintext)
+        aead_seal(&self.key[..], plaintext)
     }
 
     fn unseal(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        aead_unseal(&self.key, ciphertext)
+        aead_unseal(&self.key[..], ciphertext)
     }
 
     fn tpm_available(&self) -> bool {

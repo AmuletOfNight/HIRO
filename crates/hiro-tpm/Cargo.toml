@@ -17,6 +17,7 @@ hiro-core.workspace = true
 thiserror.workspace = true
 aes-gcm.workspace = true
 log.workspace = true
+zeroize = "1"
 tss-esapi = { version = "7.7", optional = true }
 
 [dev-dependencies]

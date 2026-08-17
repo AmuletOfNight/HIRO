@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use hiro_core::proto::{
@@ -13,9 +13,27 @@ use hiro_core::proto::{
 use hiro_core::{PROTOCOL_VERSION, VERSION};
 
 use crate::audit::audit;
-use crate::auth;
+use crate::auth::{self, AuthError};
 use crate::policy::{authorize, Caller};
 use crate::state::SharedDaemon;
+
+/// Maximum concurrent client connections. The daemon spawns a thread per
+/// connection, so this bounds thread/fd exhaustion by local callers (the
+/// socket is world-connectable by design).
+const MAX_CONNECTIONS: usize = 32;
+/// Idle read timeout on a client connection: a connection that sends
+/// nothing for this long is closed instead of pinning a thread forever.
+const CONN_IDLE_TIMEOUT_SECS: i64 = 30;
+
+/// Guard that releases the connection-slot counter when the handler
+/// thread exits (normally or via a panic).
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Serve requests on the configured socket until `shutdown` is set.
 pub fn serve(daemon: SharedDaemon, shutdown: Arc<AtomicBool>) -> Result<(), String> {
@@ -44,11 +62,30 @@ pub fn serve(daemon: SharedDaemon, shutdown: Arc<AtomicBool>) -> Result<(), Stri
         .map_err(|e| format!("cannot set socket nonblocking: {e}"))?;
     log::info!("hirod listening on {}", path.display());
 
+    let active = Arc::new(AtomicUsize::new(0));
+
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((mut stream, _)) => {
+                if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    log::warn!("rejecting connection: server busy ({MAX_CONNECTIONS} max)");
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.write_all(
+                        serde_json::to_string(&Response::err(0, "server busy"))
+                            .map(|mut s| {
+                                s.push('\n');
+                                s
+                            })
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    );
+                    continue;
+                }
+                active.fetch_add(1, Ordering::Relaxed);
+                let slot = ConnSlot(active.clone());
                 let daemon = daemon.clone();
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         handle_conn(&daemon, stream);
                     }));
@@ -76,30 +113,104 @@ fn peer_credentials(stream: &UnixStream) -> Option<Caller> {
     })
 }
 
-/// Stream authentication state events to a `Op::Watch` subscriber until
-/// the connection closes.
-fn handle_watch(daemon: &SharedDaemon, writer: &mut UnixStream) {
+/// Set an idle read timeout on a connected stream so a silent client can
+/// never pin a handler thread forever.
+fn set_read_timeout(stream: &UnixStream, secs: i64) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: libc::time_t,
+        tv_usec: libc::suseconds_t,
+    }
+    let tv = Timeval {
+        tv_sec: secs as libc::time_t,
+        tv_usec: 0,
+    };
+    // SAFETY: tv is a valid timeval; the fd is a valid socket descriptor.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&tv as *const Timeval).cast(),
+            std::mem::size_of::<Timeval>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Whether the peer process is still connected (data pending, or alive and
+/// idle). Uses a non-blocking `recv(MSG_PEEK|MSG_DONTWAIT)` so it never
+/// blocks; returns false only on EOF or a hard error.
+fn peer_alive(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut probe = [0u8; 1];
+    // SAFETY: probe is valid writable storage of one byte; MSG_PEEK does not
+    // consume data and MSG_DONTWAIT never blocks.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            probe.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n > 0 {
+        return true;
+    }
+    if n == 0 {
+        return false; // EOF: the peer closed its end
+    }
+    // n < 0: EAGAIN/EWOULDBLOCK means alive but no data pending.
+    matches!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// Stream authentication state events to an `Op::Watch` subscriber until
+/// the connection closes. Events are filtered by caller (root sees all,
+/// everyone else only their own user) and pushed through a bounded channel;
+/// a subscriber that stops reading is dropped instead of accumulating
+/// unbounded buffered events in the daemon.
+fn handle_watch(daemon: &SharedDaemon, writer: &mut UnixStream, caller: Caller) {
     use std::io::Write;
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(crate::state::WATCH_BUFFER);
     {
         let mut watchers = match daemon.watchers.lock() {
             Ok(w) => w,
             Err(_) => return,
         };
-        watchers.push(tx);
+        watchers.push(crate::state::Watcher { caller, tx });
     }
     if let Ok(json) = serde_json::to_string(&hiro_core::proto::StateEvent::idle()) {
         let mut line = json;
         line.push('\n');
         let _ = writer.write_all(line.as_bytes());
     }
-    while let Ok(line) = rx.recv() {
-        if writer.write_all(line.as_bytes()).is_err() {
-            break;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(line) => {
+                if writer.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // No events for a while: verify the peer is still there so
+                // a vanished client cannot pin this thread indefinitely.
+                if !peer_alive(writer) {
+                    break;
+                }
+            }
         }
-        let _ = writer.flush();
     }
-    // Sender is dropped here; broadcast_state prunes dead senders.
+    // Sender is dropped here; broadcast_state prunes dead/full senders.
 }
 
 fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
@@ -110,6 +221,7 @@ fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
             return;
         }
     };
+    let _ = set_read_timeout(&stream, CONN_IDLE_TIMEOUT_SECS);
     let reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
@@ -123,7 +235,7 @@ fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
         }
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(req) if matches!(req.op, Op::Watch) => {
-                handle_watch(daemon, &mut writer);
+                handle_watch(daemon, &mut writer, caller);
                 break;
             }
             Ok(req) if req.v == PROTOCOL_VERSION => dispatch(daemon, caller, req),
@@ -176,10 +288,6 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             Ok(count) => Response::ok(id, ResultValue::Cleared { count }),
             Err(e) => Response::err(id, e),
         },
-        Op::Snapshot { path } => match snapshot(daemon, &path) {
-            Ok(()) => Response::ok(id, ResultValue::Snapshot { path }),
-            Err(e) => Response::err(id, e),
-        },
         Op::KeyringSet { user, password } => match keyring_set(daemon, caller, &user, &password) {
             Ok(stored) => Response::ok(id, ResultValue::KeyringSet { stored }),
             Err(e) => Response::err(id, e),
@@ -198,14 +306,34 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             ),
             Err(e) => Response::err(id, e),
         },
-        Op::Reload => match reload(daemon) {
-            Ok(()) => Response::ok(id, ResultValue::Reloaded),
-            Err(e) => Response::err(id, e),
-        },
-        Op::Prewarm => match prewarm(daemon) {
-            Ok(()) => Response::ok(id, ResultValue::Prewarmed),
-            Err(e) => Response::err(id, e),
-        },
+        Op::Reload => {
+            // Reloading re-reads configuration and can rebuild the
+            // recognition pipeline: a root-only operation.
+            if !caller.is_root() {
+                return Response::err(
+                    id,
+                    format!("caller uid {} may not reload the daemon configuration", caller.uid),
+                );
+            }
+            match reload(daemon) {
+                Ok(()) => Response::ok(id, ResultValue::Reloaded),
+                Err(e) => Response::err(id, e),
+            }
+        }
+        Op::Prewarm => {
+            // Acquiring the camera toggles the IR emitter and contends with
+            // live requests: a root-only operation.
+            if !caller.is_root() {
+                return Response::err(
+                    id,
+                    format!("caller uid {} may not prewarm the camera", caller.uid),
+                );
+            }
+            match prewarm(daemon) {
+                Ok(()) => Response::ok(id, ResultValue::Prewarmed),
+                Err(e) => Response::err(id, e),
+            }
+        }
         Op::Login { user, service } => match auth::record_login(daemon, caller, &user, &service) {
             Ok(()) => Response::ok(id, ResultValue::Login),
             Err(e) => Response::err(id, e.to_string()),
@@ -214,7 +342,8 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             approval_id,
             user,
             allow,
-        } => match approve(daemon, caller, approval_id, &user, allow) {
+            secret,
+        } => match approve(daemon, caller, approval_id, &user, allow, secret) {
             Ok(()) => Response::ok(id, ResultValue::Approved),
             Err(e) => Response::err(id, e),
         },
@@ -222,19 +351,14 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
     }
 }
 
-fn verdict_from_error(user: &str, e: &str) -> VerifyResult {
-    let (reason, camera_ok) = if e.contains("rate limited") {
-        ("rate_limited", true)
-    } else if e.contains("locked out") {
-        ("locked_out", true)
-    } else if e.contains("no such user") {
-        ("no_such_user", true)
-    } else if e.contains("denied") {
-        ("denied", true)
-    } else if e.contains("camera") {
-        ("camera_unavailable", false)
-    } else {
-        ("error", true)
+fn verdict_from_error(user: &str, e: &AuthError) -> VerifyResult {
+    let (reason, camera_ok) = match e {
+        AuthError::RateLimited => ("rate_limited", true),
+        AuthError::LockedOut => ("locked_out", true),
+        AuthError::NoSuchUser(_) => ("no_such_user", true),
+        AuthError::Denied(_) => ("denied", true),
+        AuthError::Camera(_) => ("camera_unavailable", false),
+        AuthError::Internal(_) => ("error", true),
     };
     VerifyResult {
         matched: false,
@@ -259,14 +383,19 @@ fn uid_of(user: &str) -> Result<u32, String> {
 
 /// Record an Allow/Disallow decision for a pending action approval.
 ///
-/// Only the target user (or root) may decide. The id comes from the
-/// `approval_id` field on the `approval_pending` StateEvent.
+/// Only the target user (or root) may decide. For approvals rendered on
+/// the secure console (`approval.secure_desktop`), the caller must also be
+/// root *and* present the per-approval secret that `hirod` gave to the
+/// root-owned `hiro-approve` dialog it spawned — so a compromised user
+/// session cannot silently approve. The id comes from the `approval_id`
+/// field on the `approval_pending` StateEvent.
 fn approve(
     daemon: &SharedDaemon,
     caller: Caller,
     approval_id: u64,
     user: &str,
     allow: bool,
+    secret: Option<String>,
 ) -> Result<(), String> {
     let uid = uid_of(user)?;
     if !authorize(caller, Some(uid)) {
@@ -287,6 +416,17 @@ fn approve(
             "approval {approval_id} is for {}, not {user}",
             pending.user
         ));
+    }
+    if pending.secret.is_some() {
+        // Secure-console approval: the decision may only come from the
+        // root-owned dialog process that holds this approval's secret.
+        if !caller.is_root() || secret.as_deref() != pending.secret.as_deref() {
+            return Err(
+                "this approval is pinned to the secure console dialog; \
+                 the caller must be root and present the dialog's secret"
+                    .into(),
+            );
+        }
     }
     pending.decided = Some(allow);
     let service = pending.service.clone();
@@ -396,6 +536,10 @@ fn clear(daemon: &SharedDaemon, caller: Caller, user: &str) -> Result<usize, Str
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
     let count = store.clear_templates(user).map_err(|e| e.to_string())?;
+    // Removing every template also drops the camera pinning record, so a
+    // follow-up `hiro enroll` starts fresh (this is what the "run `hiro
+    // clear` first" advice in the camera-changed error means).
+    store.clear_camera_binding(user).map_err(|e| e.to_string())?;
     audit(
         &store,
         Some(user),
@@ -483,39 +627,6 @@ fn keyring_status(
         .map_err(|e| e.to_string())?
         .is_some();
     Ok((enabled, stored))
-}
-
-fn snapshot(daemon: &SharedDaemon, path: &str) -> Result<(), String> {
-    let mut camera = daemon
-        .camera
-        .lock()
-        .map_err(|_| "camera lock poisoned".to_string())?;
-    camera.acquire().map_err(|e| e.to_string())?;
-    let frame = camera
-        .next_frame(std::time::Duration::from_secs(5))
-        .map_err(|e| e.to_string())?
-        .ok_or("camera timed out")?;
-    let gray = frame.to_gray().ok_or_else(|| {
-        format!(
-            "frame format has no luma ({} bytes, {}x{}, {:?})",
-            frame.data.len(),
-            frame.width,
-            frame.height,
-            frame.format
-        )
-    })?;
-    let mut out = format!("P5\n{} {}\n255\n", frame.width, frame.height).into_bytes();
-    out.extend_from_slice(&gray);
-    std::fs::write(path, out).map_err(|e| format!("cannot write {path}: {e}"))?;
-    camera.release();
-    {
-        let store = daemon
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())?;
-        audit(&store, None, "snapshot", path);
-    }
-    Ok(())
 }
 
 fn reload(daemon: &SharedDaemon) -> Result<(), String> {

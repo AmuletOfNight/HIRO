@@ -45,7 +45,9 @@ to the rest of the stack as \fBPAM_AUTHTK\fR so the login keyring unlocks.
 Only meaningful on services whose stack ends with \fBpam_gnome_keyring\fR
 or \fBpam_kwallet\fR (graphical greeters, session login). Requires
 \fI[keyring] enabled = true\fR and \fBhiro keyring set\fR; the daemon
-re-verifies the password against the account before releasing it.
+re-verifies the password against the account before releasing it, and
+releases it only to root callers (greeter/login stacks run as root; a
+process running as the user never receives it).
 .TP
 .B debug
 Verbose logging via \fBpam_syslog\fR.

@@ -31,6 +31,7 @@
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::{Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 
 use hiro_core::proto::{Op, Outcome, Request, Response};
@@ -194,12 +195,67 @@ fn set_read_timeout(stream: &UnixStream, timeout_ms: u64) -> std::io::Result<()>
     }
 }
 
+/// Whether the socket path is a root-owned Unix socket (not a regular file,
+/// symlink to one, or a non-root object). Prevents a fake daemon planted at
+/// a misconfigured socket path from answering `matched: true`.
+fn socket_is_root_owned_socket(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => md.file_type().is_socket() && md.uid() == 0,
+        Err(_) => false,
+    }
+}
+
+/// Whether the peer process behind a connected Unix stream is root. On the
+/// client end of a connected socket, `SO_PEERCRED` returns the server
+/// process's credentials; the daemon runs as root, so anything else is a
+/// rogue responder.
+fn peer_is_root(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Ucred {
+        pid: i32,
+        uid: u32,
+        gid: u32,
+    }
+    let mut cred = Ucred::default();
+    let mut len = std::mem::size_of::<Ucred>() as libc::socklen_t;
+    // SAFETY: cred is writable storage of the correct size for a struct
+    // ucred; len is updated by the kernel.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut Ucred).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && cred.uid == 0
+}
+
 fn ask_daemon(
+    pamh: *const PamHandle,
     opts: &ModuleOptions,
     user: &str,
     service: &str,
 ) -> Option<hiro_core::proto::VerifyResult> {
+    // Refuse anything that is not a root-owned socket: a fake responder at
+    // a misconfigured path must never be able to answer `matched: true`.
+    if !socket_is_root_owned_socket(&opts.socket) {
+        return None;
+    }
     let mut stream = UnixStream::connect(&opts.socket).ok()?;
+    if !peer_is_root(&stream) {
+        log(
+            pamh,
+            opts,
+            LOG_ERR,
+            "hiro: daemon socket peer is not root; refusing verdict",
+        );
+        return None;
+    }
     let req = Request {
         v: PROTOCOL_VERSION,
         id: 0,
@@ -254,7 +310,7 @@ fn authenticate_impl(pamh: *const PamHandle, argc: c_int, argv: *const *const c_
         );
     }
 
-    match ask_daemon(&opts, &user, &service) {
+    match ask_daemon(pamh, &opts, &user, &service) {
         Some(verdict) if verdict.matched => {
             if let Some(password) = verdict.keyring_password.as_deref() {
                 if set_authtok(pamh, password) == PAM_SUCCESS {
@@ -343,11 +399,19 @@ pub extern "C" fn pam_sm_acct_mgmt(
 /// Tell `hirod` that `user` just logged in, so face auth arms for them
 /// until the next reboot. Best-effort and intentionally side-effect free:
 /// any failure is swallowed, and the session always opens.
-fn notify_login(opts: &ModuleOptions, user: &str, service: &str) {
+fn notify_login(_pamh: *const PamHandle, opts: &ModuleOptions, user: &str, service: &str) {
+    // Same trust checks as the auth path: only a root-owned socket whose
+    // peer is the real (root) daemon may be notified.
+    if !socket_is_root_owned_socket(&opts.socket) {
+        return;
+    }
     let mut stream = match UnixStream::connect(&opts.socket) {
         Ok(s) => s,
         Err(_) => return,
     };
+    if !peer_is_root(&stream) {
+        return;
+    }
     let req = Request {
         v: PROTOCOL_VERSION,
         id: 0,
@@ -383,7 +447,7 @@ fn open_session_impl(pamh: *const PamHandle, argc: c_int, argv: *const *const c_
             &format!("hiro: recording login for {user} via {}", opts.socket),
         );
     }
-    notify_login(&opts, &user, &service);
+    notify_login(pamh, &opts, &user, &service);
     PAM_SUCCESS
 }
 

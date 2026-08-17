@@ -1,5 +1,8 @@
 # HIRO — Windows Hello-style face authentication for Linux
 
+**Hello, InfraRed, On Linux** — an open-source, offline take on Windows
+Hello that recognizes you through your laptop's IR camera.
+
 HIRO uses your laptop's built-in **Windows Hello IR camera** to authenticate
 through PAM: login, lock screen, `sudo`, `su`, and polkit prompts. It aims
 for the Windows Hello security bar: IR-only enforcement, anti-spoof

@@ -4,11 +4,14 @@
 use std::path::Path;
 
 use hiro_core::{CoreError, Result};
+use zeroize::Zeroizing;
 
 use crate::{aead_seal, aead_unseal, fill_random, read_keyfile, write_keyfile, KeyManager};
 
 pub struct SoftwareKeyManager {
-    key: [u8; 32],
+    /// The data key. Wrapped in `Zeroizing` so the in-memory key is wiped
+    /// when the manager is dropped.
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl SoftwareKeyManager {
@@ -17,7 +20,9 @@ impl SoftwareKeyManager {
         let data = read_keyfile(path)?;
         let mut key = [0u8; 32];
         key.copy_from_slice(&data);
-        Ok(Self { key })
+        Ok(Self {
+            key: Zeroizing::new(key),
+        })
     }
 
     /// Generate a fresh data key and write it to `path` with mode 0600.
@@ -26,22 +31,26 @@ impl SoftwareKeyManager {
         let mut key = [0u8; 32];
         fill_random(&mut key);
         write_keyfile(path, &key)?;
-        Ok(Self { key })
+        Ok(Self {
+            key: Zeroizing::new(key),
+        })
     }
 
     /// Build directly from a known key (tests, import flows).
     pub fn from_key(key: [u8; 32]) -> Self {
-        Self { key }
+        Self {
+            key: Zeroizing::new(key),
+        }
     }
 }
 
 impl KeyManager for SoftwareKeyManager {
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        aead_seal(&self.key, plaintext)
+        aead_seal(&self.key[..], plaintext)
     }
 
     fn unseal(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        aead_unseal(&self.key, ciphertext)
+        aead_unseal(&self.key[..], ciphertext)
     }
 
     fn tpm_available(&self) -> bool {

@@ -1,11 +1,13 @@
 //! Authentication and enrollment flows.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use hiro_core::proto::{EnrollResult, QualityReport, StateEvent, VerifyResult};
 use hiro_core::{constant_time_match, Config, Embedding};
 use hiro_face::FacePipeline;
 use hiro_hw::frame as hwframe;
+use zeroize::Zeroizing;
 
 use crate::audit::audit;
 use crate::camera::CameraSession;
@@ -21,6 +23,22 @@ pub enum AuthError {
     LockedOut,
     Camera(String),
     Internal(String),
+}
+
+impl AuthError {
+    /// Stable, machine-readable reason code for this error. Used for
+    /// verdicts and state-event broadcasts so client-influenced strings
+    /// (usernames, service names) can never alter the reported reason.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::NoSuchUser(_) => "no_such_user",
+            Self::Denied(_) => "denied",
+            Self::RateLimited => "rate_limited",
+            Self::LockedOut => "locked_out",
+            Self::Camera(_) => "camera_unavailable",
+            Self::Internal(_) => "error",
+        }
+    }
 }
 
 impl std::fmt::Display for AuthError {
@@ -45,6 +63,29 @@ static DIALOG_SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 fn target_uid(user: &str) -> AuthResult<u32> {
     crate::lookup::uid_of(user).ok_or_else(|| AuthError::NoSuchUser(user.into()))
+}
+
+/// The camera-pinning binding recorded at enrollment and re-checked at
+/// verification: USB identity fingerprint, kernel driver, and the canonical
+/// sysfs device path.
+///
+/// `vid:pid:bus:serial` alone is spoofable in USB descriptors, and most UVC
+/// cameras report no serial. Binding to the kernel's device node path and
+/// driver (which USB descriptors cannot influence) plus a per-user random
+/// secret stored at enrollment makes a swapped-in camera fail verification
+/// unless it lands on the exact same node topology *and* the stored pinning
+/// record (with its secret) is present and untouched.
+fn camera_binding(camera: &CameraSession) -> String {
+    let fp = camera
+        .identity()
+        .map(|i| i.fingerprint())
+        .unwrap_or_else(|| "unknown".into());
+    let driver = camera.driver().unwrap_or_else(|| "?".into());
+    let sysfs = camera
+        .camera_path()
+        .and_then(|p| hiro_hw::discover::sysfs_device_path(Path::new(&p)))
+        .unwrap_or_else(|| "?".into());
+    format!("{fp}|{driver}|{sysfs}")
 }
 
 struct LoadedTemplate {
@@ -310,6 +351,10 @@ fn calibrate_threshold(
 }
 
 /// Run a face-verification attempt for `user`.
+///
+/// Returns the verdict (with `matched` and a stable `reason`) or a typed
+/// error; never an unstructured string, so caller-supplied strings cannot
+/// influence the reason reported to PAM or the status indicator.
 pub fn verify(
     daemon: &SharedDaemon,
     caller: Caller,
@@ -317,21 +362,20 @@ pub fn verify(
     service: &str,
     timeout_ms: u64,
     want_keyring: bool,
-) -> Result<VerifyResult, String> {
+) -> AuthResult<VerifyResult> {
     let started = Instant::now();
     // Resolve and authorize up front so the after-reboot gate reports the
     // same "no such user" / "denied" reasons as a normal attempt (and does
     // not leak armed state to unauthorized callers).
-    let uid = target_uid(user).map_err(|e| e.to_string())?;
+    let uid = target_uid(user)?;
     if !authorize(caller, Some(uid)) {
         return Err(AuthError::Denied(format!(
             "caller uid {} may not verify for {user}",
             caller.uid
-        ))
-        .to_string());
+        )));
     }
 
-    if boot_gate_blocks(daemon, user).map_err(|e| e.to_string())? {
+    if boot_gate_blocks(daemon, user)? {
         // The user has not logged in since the last reboot: refuse without
         // touching the camera. This is a clean non-match (password
         // fallback), never an error.
@@ -339,7 +383,7 @@ pub fn verify(
             let store = daemon
                 .store
                 .lock()
-                .map_err(|_| "store lock poisoned".to_string())?;
+                .map_err(|_| AuthError::Internal("store lock poisoned".into()))?;
             audit(
                 &store,
                 Some(user),
@@ -382,17 +426,13 @@ pub fn verify(
             motion: None,
             keyring_password: None,
             reason: "password_required".into(),
-            threshold_used: effective_threshold(daemon, user).map_err(|e| e.to_string())?,
+            threshold_used: effective_threshold(daemon, user)?,
         });
     }
 
     if let Err(err) = policy_gate(daemon, user) {
         // Rejected before any scanning happens; tell watchers right away.
-        let reason = match &err {
-            AuthError::RateLimited => "rate_limited",
-            AuthError::LockedOut => "locked_out",
-            _ => "error",
-        };
+        let reason = err.reason_code();
         crate::state::broadcast_state(
             daemon,
             &StateEvent {
@@ -415,7 +455,7 @@ pub fn verify(
                 user_present: None,
             },
         );
-        return Err(err.to_string());
+        return Err(err);
     }
     crate::state::broadcast_state(daemon, &StateEvent::scanning(user));
     match verify_inner(daemon, caller, user, service, timeout_ms) {
@@ -429,7 +469,7 @@ pub fn verify(
                 let cfg = daemon
                     .cfg
                     .read()
-                    .map_err(|_| "cfg lock poisoned".to_string())?
+                    .map_err(|_| AuthError::Internal("cfg lock poisoned".into()))?
                     .clone();
                 // Cap the decision window by the remaining request budget
                 // so the PAM caller is never kept waiting past its timeout.
@@ -463,17 +503,21 @@ pub fn verify(
                 }
             }
             if want_keyring {
-                attach_keyring_password(daemon, user, service, &mut result);
+                attach_keyring_password(daemon, caller, user, service, &mut result);
             }
             result.elapsed_ms = started.elapsed().as_millis() as u64;
             {
                 let mut policy = daemon
                     .policy
                     .lock()
-                    .map_err(|_| "policy lock poisoned".to_string())?;
+                    .map_err(|_| AuthError::Internal("policy lock poisoned".into()))?;
                 if result.matched {
                     policy.record_success(user);
-                } else {
+                } else if failure_counts_toward_lockout(&result.reason) {
+                    // Only genuine failed attempts (no match, denied
+                    // approval, liveness failure) accumulate towards the
+                    // lockout; environmental verdicts (no templates,
+                    // camera mismatch/unavailable) are not user failures.
                     policy.record_failure(user);
                 }
             }
@@ -491,7 +535,7 @@ pub fn verify(
                 let store = daemon
                     .store
                     .lock()
-                    .map_err(|_| "store lock poisoned".to_string())?;
+                    .map_err(|_| AuthError::Internal("store lock poisoned".into()))?;
                 audit(
                     &store,
                     Some(user),
@@ -530,7 +574,7 @@ pub fn verify(
             let store = daemon
                 .store
                 .lock()
-                .map_err(|_| "store lock poisoned".to_string())?;
+                .map_err(|_| AuthError::Internal("store lock poisoned".into()))?;
             audit(
                 &store,
                 Some(user),
@@ -544,7 +588,7 @@ pub fn verify(
                     op: "verify".into(),
                     user: Some(user.into()),
                     score: None,
-                    reason: Some(e.to_string()),
+                    reason: Some(e.reason_code().into()),
                     variance: None,
                     motion: None,
                     min_variance: None,
@@ -559,9 +603,21 @@ pub fn verify(
                     user_present: None,
                 },
             );
-            Err(e.to_string())
+            Err(e)
         }
     }
+}
+
+/// Verdict reasons that represent a real failed authentication attempt and
+/// should accumulate towards the per-user lockout counter. Environmental
+/// verdicts (`no_templates`, `camera_mismatch`, `camera_unavailable`,
+/// `password_required`) are not user failures and must not let a stuck
+/// camera state lock a user out of face auth.
+fn failure_counts_toward_lockout(reason: &str) -> bool {
+    matches!(
+        reason,
+        "no_match" | "no_face" | "liveness_failed" | "approval_denied" | "approval_timeout"
+    )
 }
 
 fn verify_inner(
@@ -621,18 +677,27 @@ fn verify_inner(
         .map_err(|e| AuthError::Camera(e.to_string()))?;
 
     if !allow_camera_change {
-        let current = camera
-            .identity()
-            .map(|i| i.fingerprint())
-            .unwrap_or_else(|| "unknown".into());
-        let stored = daemon
-            .store
-            .lock()
-            .map_err(|_| AuthError::Internal("store lock poisoned".into()))?
-            .camera_fingerprint(user)
-            .map_err(|e| AuthError::Internal(e.to_string()))?;
-        if let Some(stored) = stored {
-            if stored != current {
+        let current = camera_binding(&camera);
+        let (stored_binding, stored_secret) = {
+            let store = daemon
+                .store
+                .lock()
+                .map_err(|_| AuthError::Internal("store lock poisoned".into()))?;
+            (
+                store.camera_fingerprint(user).map_err(|e| {
+                    AuthError::Internal(format!("cannot read camera binding: {e}"))
+                })?,
+                store
+                    .camera_secret(user)
+                    .map_err(|e| AuthError::Internal(format!("cannot read camera pin: {e}")))?,
+            )
+        };
+        // Fail closed: an enrollment that did not record both a binding and
+        // a per-user pin secret is not pinned and cannot verify. A rogue
+        // camera must not be accepted just because the DB record is empty.
+        let pinned = match (stored_binding, stored_secret) {
+            (Some(binding), Some(secret)) if !binding.is_empty() && !secret.is_empty() => binding,
+            _ => {
                 camera.release();
                 return Ok(VerifyResult {
                     matched: false,
@@ -650,6 +715,24 @@ fn verify_inner(
                     threshold_used: threshold,
                 });
             }
+        };
+        if pinned != current {
+            camera.release();
+            return Ok(VerifyResult {
+                matched: false,
+                user: user.into(),
+                score: None,
+                template_id: None,
+                frames_analyzed: 0,
+                liveness_ok: false,
+                camera_ok: false,
+                elapsed_ms: 0,
+                variance: None,
+                motion: None,
+                keyring_password: None,
+                reason: "camera_mismatch".into(),
+                threshold_used: threshold,
+            });
         }
     }
 
@@ -905,9 +988,18 @@ fn run_approval_phase(
     let max_absent_frames = cfg.approval.absent_frames.max(1);
     let score = result.score.unwrap_or(result.threshold_used);
 
-    let id = daemon
-        .next_approval_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = crate::state::random_approval_id();
+    // Secure-console approvals carry a per-approval secret that only the
+    // root-owned `hiro-approve` dialog (which receives it on its command
+    // line) knows; `Op::Approve` must present it together with root.
+    let secret = if cfg.approval.secure_desktop {
+        Some(crate::state::random_secret())
+    } else {
+        None
+    };
+    // The dialog needs the secret too; keep a copy since the original is
+    // moved into the pending-approval record below.
+    let dialog_secret = secret.clone();
 
     // Register the pending approval so `Op::Approve` can find it, pruning
     // any entries a panicked handler may have left behind.
@@ -925,6 +1017,7 @@ fn run_approval_phase(
                 service: service.into(),
                 score,
                 decided: None,
+                secret,
                 created: Instant::now(),
             },
         );
@@ -947,9 +1040,17 @@ fn run_approval_phase(
 
     // With the secure console enabled, the decision happens on a dedicated
     // VT (spawned outside the hardened daemon unit via systemd-run, with a
-    // direct fallback when systemd is absent).
+    // direct fallback when systemd is absent). Only this root-owned dialog
+    // can decide: `Op::Approve` is gated on root + the secret below.
     if secure {
-        spawn_secure_dialog(daemon, id, user, service, timeout_ms);
+        spawn_secure_dialog(
+            daemon,
+            id,
+            user,
+            service,
+            timeout_ms,
+            dialog_secret.as_deref(),
+        );
     }
 
     // Keep watching the user for the rest of the window.
@@ -1052,7 +1153,14 @@ fn run_approval_phase(
                 // Re-open the secure console dialog, which dismissed itself
                 // when the user stepped away.
                 if secure {
-                    spawn_secure_dialog(daemon, id, user, service, timeout_ms);
+                    spawn_secure_dialog(
+                        daemon,
+                        id,
+                        user,
+                        service,
+                        timeout_ms,
+                        dialog_secret.as_deref(),
+                    );
                 }
             }
         } else {
@@ -1087,7 +1195,19 @@ fn run_approval_phase(
 /// direct spawn when systemd is not available (e.g. hirod started from a
 /// terminal). Best-effort: if the dialog cannot be shown, the approval
 /// simply waits out its window as if no one were watching.
-fn spawn_secure_dialog(daemon: &SharedDaemon, id: u64, user: &str, service: &str, timeout_ms: u64) {
+///
+/// The per-approval `secret` is passed to the dialog so its decision can be
+/// authenticated (`Op::Approve` requires root + this secret for secure
+/// approvals). Non-root processes cannot read a root process's argv, so a
+/// compromised session never learns it.
+fn spawn_secure_dialog(
+    daemon: &SharedDaemon,
+    id: u64,
+    user: &str,
+    service: &str,
+    timeout_ms: u64,
+    secret: Option<&str>,
+) {
     let (dialog, vt, socket) = {
         let cfg = match daemon.cfg.read() {
             Ok(c) => c.clone(),
@@ -1099,7 +1219,7 @@ fn spawn_secure_dialog(daemon: &SharedDaemon, id: u64, user: &str, service: &str
             cfg.daemon.socket_path.clone(),
         )
     };
-    let args = [
+    let mut args = vec![
         format!("--vt={vt}"),
         format!("--socket={}", socket.display()),
         format!("--user={user}"),
@@ -1107,6 +1227,9 @@ fn spawn_secure_dialog(daemon: &SharedDaemon, id: u64, user: &str, service: &str
         format!("--service={service}"),
         format!("--timeout-ms={timeout_ms}"),
     ];
+    if let Some(s) = secret {
+        args.push(format!("--secret={s}"));
+    }
     let dialog_str = dialog.display().to_string();
 
     std::thread::spawn(move || {
@@ -1141,6 +1264,10 @@ fn spawn_secure_dialog(daemon: &SharedDaemon, id: u64, user: &str, service: &str
 /// All of these must hold or the password stays sealed:
 ///
 /// * the request explicitly asked for it (`want_keyring`),
+/// * the caller is **root** — greeter and login stacks run as root, and
+///   restricting release to root closes the silent-harvesting hole where a
+///   process running as the user could ask for their own login password
+///   and receive it the moment the user's face was in front of the camera,
 /// * the match is real,
 /// * the feature is enabled and the PAM service is listed in
 ///   `keyring.services`,
@@ -1153,11 +1280,21 @@ fn spawn_secure_dialog(daemon: &SharedDaemon, id: u64, user: &str, service: &str
 /// instead of failing authentication.
 fn attach_keyring_password(
     daemon: &SharedDaemon,
+    caller: Caller,
     user: &str,
     service: &str,
     result: &mut VerifyResult,
 ) {
     if !result.matched {
+        return;
+    }
+    // Root-only release. Greeter/login PAM stacks run as root; a
+    // same-uid process asking for the password must never get it, even on
+    // a listed "bypass" service — the daemon cannot tell a real greeter
+    // from malware with the same uid. (A root caller could obtain the
+    // password anyway, e.g. from /etc/shadow, so root is the trusted
+    // boundary.)
+    if !caller.is_root() {
         return;
     }
     let cfg = match daemon.cfg.read() {
@@ -1190,6 +1327,10 @@ fn attach_keyring_password(
         log::error!("hiro: sealed keyring password for {user} is not valid UTF-8");
         return;
     };
+    // Zeroize the password buffer when it goes out of scope at the end of
+    // this function (the copy put into the response is freed after the
+    // connection writes it).
+    let password = Zeroizing::new(password);
 
     if !daemon.password_checker.check(user, &password) {
         log::warn!(
@@ -1211,7 +1352,9 @@ fn attach_keyring_password(
         return;
     }
 
-    result.keyring_password = Some(password);
+    // Zeroizing<String> zeroizes the password buffer on drop; the copy in
+    // the response is dropped as soon as the connection writes it.
+    result.keyring_password = Some(password.to_string());
     {
         let store = match daemon.store.lock() {
             Ok(s) => s,
@@ -1276,6 +1419,13 @@ pub fn enroll(
         return Err(
             "password login required after reboot; log in once before enrolling a face".to_string(),
         );
+    }
+    // Enrollment holds the camera for up to tens of seconds and streams
+    // per-frame progress events; like verify it must be rate-limited, or a
+    // local user could monopolise the camera indefinitely (blocking every
+    // other user's face auth) and drive watcher memory growth.
+    if let Err(err) = policy_gate(daemon, user) {
+        return Err(err.to_string());
     }
     crate::state::broadcast_state(daemon, &StateEvent::enrolling(user));
 
@@ -1492,26 +1642,43 @@ fn enroll_inner(
         .map_err(|_| "camera lock poisoned".to_string())?;
     camera.acquire().map_err(|e| e.to_string())?;
 
-    let current = camera
-        .identity()
-        .map(|i| i.fingerprint())
-        .unwrap_or_else(|| "unknown".into());
+    // Record the camera-pinning binding (USB identity + driver + sysfs
+    // node path) and a fresh per-user random secret. The secret marks the
+    // pinning record as genuine: verification fails closed unless both a
+    // binding and a secret are present, so a downgraded/empty record can
+    // never make a rogue camera acceptable.
+    let current = camera_binding(&camera);
+    let pin_secret = crate::state::random_bytes::<32>();
     {
         let store = daemon
             .store
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
-        if let Some(stored) = store.camera_fingerprint(user).map_err(|e| e.to_string())? {
-            if stored != current {
-                camera.release();
-                return Err(format!(
-                    "camera changed since previous enrollment ({stored} vs {current}); \
-                     run `hiro clear` first or set security.allow_camera_change"
-                ));
+        // Only a genuinely pinned record (one carrying a pin secret) is
+        // compared against the current camera. Records written before the
+        // binding+secret format carry no secret and therefore pinned
+        // nothing — treat them as unpinned so the first enrollment after an
+        // upgrade simply re-pins instead of locking the user out.
+        let pinned = store
+            .camera_secret(user)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|s| !s.is_empty());
+        if pinned {
+            if let Some(stored) = store.camera_fingerprint(user).map_err(|e| e.to_string())? {
+                if stored != current {
+                    camera.release();
+                    return Err(format!(
+                        "camera changed since previous enrollment ({stored} vs {current}); \
+                         run `hiro clear` first or set security.allow_camera_change"
+                    ));
+                }
             }
         }
         store
             .set_camera_fingerprint(user, &current)
+            .map_err(|e| e.to_string())?;
+        store
+            .set_camera_secret(user, Some(&pin_secret))
             .map_err(|e| e.to_string())?;
     }
 
@@ -1529,11 +1696,17 @@ fn enroll_inner(
     let mut rejected = 0usize;
     let mut primary_reject: Option<&'static str> = None;
     let deadline = Duration::from_secs(60);
+    // If no face is ever detected, do not hold the camera for the full
+    // window: fail fast so an absent/stale enrollment cannot monopolise the
+    // camera (which would block every other user's face auth).
+    const NO_FACE_BUDGET: Duration = Duration::from_secs(15);
+    let mut saw_face = false;
 
     let loop_start = Instant::now();
     while candidates.len() < target
         && frames_analyzed < max_frames
         && loop_start.elapsed() < deadline
+        && (saw_face || loop_start.elapsed() < NO_FACE_BUDGET)
     {
         let frame = match camera.next_frame(Duration::from_millis(250)) {
             Ok(Some(f)) => f,
@@ -1588,7 +1761,10 @@ fn enroll_inner(
         // Run the detector only, then apply the cheap face-size and
         // sharpness gates before paying for the embedder.
         let det = match pipeline.detect(&gray, frame.width, frame.height) {
-            Ok(Some(d)) => d,
+            Ok(Some(d)) => {
+                saw_face = true;
+                d
+            }
             Ok(None) => {
                 rejected += 1;
                 note_rejection(&mut primary_reject, "no_face");
@@ -1839,7 +2015,6 @@ mod tests {
                 logged_in: Default::default(),
             }),
             approvals: Mutex::new(std::collections::HashMap::new()),
-            next_approval_id: std::sync::atomic::AtomicU64::new(1),
             config_path: None,
             started_at: std::time::Instant::now(),
         })
@@ -1938,6 +2113,94 @@ mod tests {
         assert!(
             result.rejected > 0,
             "static frames should be counted as rejected"
+        );
+    }
+
+    /// Migration path: a pre-pin enrollment (old bare fingerprint, no pin
+    /// secret) pinned nothing, so the next enrollment must re-pin without
+    /// tripping the "camera changed" error. Verification of such a record
+    /// stays fail-closed (no secret = camera_mismatch), forcing a genuine
+    /// re-enrollment.
+    #[test]
+    fn legacy_unpinned_record_re_pins_on_enrollment() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        // Simulate a record written before the binding+secret format.
+        {
+            let store = daemon.store.lock().unwrap();
+            store
+                .upsert_user(&user, Some(i64::from(me.uid.as_raw())))
+                .unwrap();
+            store
+                .set_camera_fingerprint(
+                    &user,
+                    "13d3:56ea:usb-0000:00:14.0-7.3:10126159",
+                )
+                .unwrap();
+            assert!(store.camera_secret(&user).unwrap().is_none());
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        let result = enroll(&daemon, caller, &user, 2).unwrap();
+        assert!(
+            result.added >= 1,
+            "legacy record must allow re-enrollment: {:?}",
+            result.reports
+        );
+        // The pin is now the new binding + secret.
+        let store = daemon.store.lock().unwrap();
+        let fp = store
+            .camera_fingerprint(&user)
+            .unwrap()
+            .expect("binding written");
+        assert!(fp.contains('|'), "expected new binding format, got {fp}");
+        assert!(
+            store
+                .camera_secret(&user)
+                .unwrap()
+                .is_some_and(|s| !s.is_empty())
+        );
+    }
+
+    /// A genuinely pinned record that does not match the current camera
+    /// still refuses enrollment (the rogue-camera protection).
+    #[test]
+    fn genuinely_pinned_camera_mismatch_refuses_enrollment() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let store = daemon.store.lock().unwrap();
+            store
+                .upsert_user(&user, Some(i64::from(me.uid.as_raw())))
+                .unwrap();
+            store
+                .set_camera_fingerprint(
+                    &user,
+                    "13d3:56ea:usb-x:?|uvcvideo|/sys/devices/other",
+                )
+                .unwrap();
+            store.set_camera_secret(&user, Some(&[1u8; 32])).unwrap();
+        }
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        let err = enroll(&daemon, caller, &user, 2).unwrap_err();
+        assert!(
+            err.contains("camera changed"),
+            "pinned mismatch must refuse: {err}"
         );
     }
 
@@ -2097,7 +2360,10 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(err.contains("no such user"), "unexpected error: {err}");
+        assert!(
+            matches!(err, AuthError::NoSuchUser(_)),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2108,7 +2374,7 @@ mod tests {
             .unwrap();
         let caller = Caller { uid: 65534, pid: 1 };
         let err = verify(&daemon, caller, &me.name, "x", 1000, false).unwrap_err();
-        assert!(err.contains("denied"));
+        assert!(matches!(err, AuthError::Denied(_)));
     }
 
     #[test]
@@ -2275,6 +2541,32 @@ mod tests {
         let result = verify(&daemon, caller, &user, "gdm-password", 2000, true).unwrap();
         assert!(!result.matched);
         assert!(result.keyring_password.is_none());
+    }
+
+    /// H-2 regression: a process running as the user (same uid, not root)
+    /// asking for the login password on a bypass-listed keyring service
+    /// must never receive it — even with a matching face in front of the
+    /// camera. Before the root-only-release fix, this returned the
+    /// plaintext login password.
+    #[test]
+    fn non_root_caller_cannot_harvest_keyring_password() {
+        let daemon = test_daemon_with_checker(true);
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_keyring(&daemon, &user);
+        // The attacker runs as the user, not as root.
+        let caller = Caller {
+            uid: me.uid.as_raw(),
+            pid: 31_337,
+        };
+        let result = verify(&daemon, caller, &user, "gdm-password", 5000, true).unwrap();
+        assert!(result.matched, "face should match: {result:?}");
+        assert!(
+            result.keyring_password.is_none(),
+            "same-uid callers must never receive the login password: {result:?}"
+        );
     }
 
     /// Background thread that flips the pending approval for `user` to

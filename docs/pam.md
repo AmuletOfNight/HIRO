@@ -43,6 +43,11 @@ of short-circuiting, so `pam_unix ... try_first_pass` verifies it silently
 and the keyring module (`auth optional pam_gnome_keyring.so`, already
 present in gdm-password) unlocks it.
 
+The password is released **only to root callers** (greeter and login stacks
+run as root). A process running as the user never receives it — `hirod`
+cannot distinguish a real greeter from same-uid malware, so the release is
+root-gated to close that hole.
+
 Safety: if you change your login password and forget to re-run
 `hiro keyring set`, the stale secret is never released — face login keeps
 working exactly as before, and the keyring simply stays locked until you
@@ -109,10 +114,15 @@ the walk-away/timeout rules.
 
 polkit 127+ runs PAM inside a sandboxed helper. The package installs a
 drop-in at
-`/etc/systemd/system/polkit-agent-helper@.service.d/hiro.conf`
-(`PrivateDevices=no`) so the camera nodes and daemon socket stay visible.
-Without it, face auth from graphical polkit prompts fails while sudo and
-the lock screen keep working.
+`/etc/systemd/system/polkit-agent-helper@.service.d/hiro.conf`.
+`pam_hiro.so` is a thin client over the daemon's Unix socket and never
+opens device nodes (hirod owns the camera), so **no sandbox relaxation is
+installed** — the drop-in is a documentation stub. (Older builds set
+`PrivateDevices=no` there, which exposed the host `/dev` to *every* polkit
+authentication on the machine; that global weakening is gone.) If your
+distro's helper ever needs camera nodes, add the narrow
+`DeviceAllow=char-video4linux rw` entry instead of disabling
+`PrivateDevices`.
 
 ## Testing without touching your live stack
 
