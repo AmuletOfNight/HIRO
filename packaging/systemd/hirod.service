@@ -40,7 +40,14 @@ RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
+# Deny privileged/obsolete/debugging syscalls a face-auth daemon never
+# needs. NOTE: the chown family is explicitly whitelisted - SQLite calls
+# fchown() on the -wal/-shm side files to match the database file's owner,
+# and @privileged (via @chown) would otherwise SIGSYS-kill the daemon the
+# moment the store opens. (With the empty CapabilityBoundingSet above, a
+# no-op ownership change is all these can ever do anyway.)
 SystemCallFilter=~@privileged @obsolete @debug
+SystemCallFilter=chown chown32 fchown fchown32 fchownat lchown lchown32
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
