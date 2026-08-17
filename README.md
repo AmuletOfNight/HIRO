@@ -1,5 +1,9 @@
 # HIRO — Windows Hello-style face authentication for Linux
 
+<p align="center">
+  <img src="Logo/HiroLogo.png" alt="HIRO logo — Hello, InfraRed, On Linux" width="520">
+</p>
+
 **Hello, InfraRed, On Linux** — an open-source, offline take on Windows
 Hello that recognizes you through your laptop's IR camera.
 
