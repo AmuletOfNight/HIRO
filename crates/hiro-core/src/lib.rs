@@ -5,6 +5,7 @@ pub mod config;
 pub mod embed;
 pub mod error;
 pub mod proto;
+pub mod ui;
 
 pub use camera::CameraIdentity;
 pub use config::Config;

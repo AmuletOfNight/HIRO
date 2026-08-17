@@ -1,0 +1,13 @@
+[Unit]
+Description=HIRO face-auth status UI (desktop-agnostic)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hiro-ui
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

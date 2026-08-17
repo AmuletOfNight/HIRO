@@ -32,6 +32,15 @@ case "$1" in
         if [ -x /usr/bin/deb-systemd-helper ]; then
             deb-systemd-helper enable hirod.service hirod-resume.service >/dev/null || true
         fi
+
+        # Per-user session UI: enable the user unit globally so every
+        # graphical session picks it up (the XDG autostart entry covers
+        # sessions without a systemd user manager; hiro-ui's single-instance
+        # guard makes double launch harmless). Failures are fine on systems
+        # without systemd --user.
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --global enable hiro-ui.service >/dev/null 2>&1 || true
+        fi
     ;;
     abort-upgrade|abort-remove|abort-deconfigure) ;;
     *)

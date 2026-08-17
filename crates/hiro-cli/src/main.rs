@@ -353,6 +353,7 @@ fn main() {
                         "off (face match completes instantly)"
                     }
                 );
+                print_ui_line();
                 Ok(())
             }
             Ok(_) => Err("unexpected daemon response".into()),
@@ -439,6 +440,28 @@ fn read_hidden_password(prompt: &str) -> Result<String, String> {
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
+/// Print a compact line about which session UI is active, from the config
+/// file (no daemon round-trip needed; the daemon does not track the UI).
+fn print_ui_line() {
+    use hiro_core::config::UiMode;
+    let text = std::fs::read_to_string("/etc/hiro/config.toml").unwrap_or_default();
+    let active = hiro_core::config::Config::from_toml(&text)
+        .map(|c| c.ui.active)
+        .unwrap_or_default();
+    let running = match active {
+        UiMode::Off => "off".to_string(),
+        UiMode::On => "hiro-ui (forced)".to_string(),
+        UiMode::Auto => {
+            if hiro_core::ui::desktop_is_gnome() && hiro_core::ui::gnome_extension_enabled() {
+                "GNOME extension (hiro-ui defers)".to_string()
+            } else {
+                "hiro-ui".to_string()
+            }
+        }
+    };
+    println!("ui            : {running}");
+}
+
 /// Format a unix timestamp as days-ago for compact display.
 fn chrono_like(ts: i64) -> String {
     let now = std::time::SystemTime::now()
@@ -510,6 +533,40 @@ fn doctor() {
                 }
             } else {
                 println!("secure desktop disabled (approval.secure_desktop = false)");
+            }
+        }
+        Err(e) => println!("cannot read /etc/hiro/config.toml: {e}"),
+    }
+
+    println!();
+    println!("== session UI ==");
+    let ui_cfg_text = std::fs::read_to_string("/etc/hiro/config.toml").unwrap_or_default();
+    match hiro_core::config::Config::from_toml(&ui_cfg_text) {
+        Ok(cfg) => {
+            use hiro_core::config::UiMode;
+            let mode = match cfg.ui.active {
+                UiMode::Auto => "auto",
+                UiMode::On => "on",
+                UiMode::Off => "off",
+            };
+            println!("[ui] active        : {mode}");
+            if cfg.ui.active == UiMode::Off {
+                println!("session UI disabled by config");
+            } else if hiro_core::ui::desktop_is_gnome() && hiro_core::ui::gnome_extension_enabled()
+            {
+                println!("running UI         : GNOME Shell extension (hiro-status@hiro)");
+                if cfg.ui.active == UiMode::Auto {
+                    println!("hiro-ui            : defers (extension owns the UI)");
+                } else {
+                    println!("hiro-ui            : forced on by config");
+                }
+            } else {
+                println!("running UI         : hiro-ui (desktop-agnostic fallback)");
+                if !hiro_core::ui::desktop_is_gnome() {
+                    println!("desktop            : not GNOME");
+                } else {
+                    println!("desktop            : GNOME, but the extension is not enabled");
+                }
             }
         }
         Err(e) => println!("cannot read /etc/hiro/config.toml: {e}"),
