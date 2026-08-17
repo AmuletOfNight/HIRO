@@ -249,6 +249,13 @@ window
 
 ### 4.3 Animated window resize (grow/shrink, stays centred)
 
+The window is shown at **full opacity immediately** (no opacity fade-in) and raised
+with `present()`: relying on a fade-in from opacity 0 proved unreliable for re-shows
+(like the extension's overlay-opacity bug, the window could be left invisible after the
+first hide/show cycle — the initial scan rendered but every later state never did). The
+content transitions (crossfades, size morphs) provide the motion instead. Hiding keeps
+a short fade-out and resets opacity to 1 on completion.
+
 Add a `resize_timer: Option<glib::SourceId>` and helpers:
 
 ```rust

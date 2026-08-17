@@ -19,7 +19,10 @@ state stream as the GNOME Shell extension \fBhiro-status@hiro\fR. It renders
 nothing while that extension reports enabled (the extension owns the UI
 there; detection probes the running shell over D-Bus, so it does not depend
 on desktop environment variables); see the \fI[ui]\fR section of
-\fBhiro.conf\fR(5) to override detection. On the lock screen or login
+\fBhiro.conf\fR(5) to override detection. Forcing \fIactive = "on"\fR also
+disables the extension at startup (best-effort) so it cannot render the
+same overlay on top of \fBhiro-ui\fR; switching back to \fI"auto"\fR or
+\fI"off"\fR re-enables it and hands control back. On the lock screen or login
 greeter an in-session overlay cannot be shown; those requests fall back to
 your password.
 .PP

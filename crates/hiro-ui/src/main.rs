@@ -21,6 +21,8 @@ use glib::ControlFlow;
 use crate::app::App;
 use crate::detect::{decide, UiDecision};
 use crate::socket::SocketMsg;
+use hiro_core::config::UiMode;
+use hiro_core::ui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -49,14 +51,45 @@ fn main() {
     let cfg = load_config(&args.config);
     match decide(cfg.ui.active) {
         UiDecision::Disabled => {
+            // Mode is "off": if a forced "on" run earlier disabled the GNOME
+            // Shell extension, hand control back to it before exiting.
+            restore_extension_if_marked();
             log::info!("ui disabled by config ([ui] active = \"off\"); exiting");
             std::process::exit(0);
         }
         UiDecision::Defer => {
+            // Mode is "auto" and the extension is enabled; drop any stale
+            // marker from a previous forced run and defer to the extension.
+            clear_extension_marker();
             log::info!("GNOME Shell extension hiro-status@hiro is enabled; deferring to it");
             std::process::exit(0);
         }
-        UiDecision::Active => {}
+        UiDecision::Active => {
+            if cfg.ui.active == UiMode::On {
+                // Forced mode: the extension would render the same
+                // scan/approval overlay on top of the GTK card, so disable
+                // it (best-effort) before rendering.
+                if ui::gnome_extension_disable() {
+                    mark_extension_disabled();
+                    log::info!("hiro-status@hiro disabled ([ui] active = \"on\")");
+                } else {
+                    log::warn!(
+                        "could not disable hiro-status@hiro; the GNOME Shell extension may still overlay hiro-ui"
+                    );
+                }
+            } else if let Some(ok) = restore_extension_if_marked() {
+                // Mode is "auto" and the extension is off because a forced
+                // "on" run disabled it: hand control back to the extension.
+                if ok {
+                    log::info!(
+                        "hiro-status@hiro re-enabled ([ui] active = \"auto\"); deferring to it"
+                    );
+                    std::process::exit(0);
+                }
+                // Re-enabling failed: keep rendering the fallback UI rather
+                // than leave the session without any indicator.
+            }
+        }
     }
 
     if gtk::init().is_err() {
@@ -119,6 +152,48 @@ fn single_instance() -> bool {
     // we want it held for the whole process lifetime.
     std::mem::forget(file);
     true
+}
+
+/// Marker file recording that this session's `hiro-ui` disabled the
+/// `hiro-status@hiro` GNOME Shell extension while `[ui] active = "on"`.
+/// A later run in `auto`/`off` mode uses it to hand control back to the
+/// extension (re-enabling it) instead of leaving it switched off.
+fn extension_marker_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("hiro-ui-extension-disabled")
+}
+
+fn mark_extension_disabled() {
+    if let Err(e) = std::fs::write(extension_marker_path(), b"") {
+        log::warn!("cannot write extension marker {}: {e}", extension_marker_path().display());
+    }
+}
+
+fn clear_extension_marker() {
+    let _ = std::fs::remove_file(extension_marker_path());
+}
+
+/// If a previous forced (`[ui] active = "on"`) run disabled the GNOME Shell
+/// extension, re-enable it and forget the marker so the extension owns the
+/// UI again. Returns `None` when there was no marker, `Some(true)` when the
+/// extension is on afterwards (re-enabled here or already was), and
+/// `Some(false)` when re-enabling failed.
+fn restore_extension_if_marked() -> Option<bool> {
+    if !extension_marker_path().exists() {
+        return None;
+    }
+    let ok = ui::gnome_extension_enable();
+    clear_extension_marker();
+    if ok {
+        log::info!("re-enabled hiro-status@hiro (handing control back to the extension)");
+    } else {
+        log::warn!(
+            "could not re-enable hiro-status@hiro; run `gnome-extensions enable hiro-status@hiro` manually"
+        );
+    }
+    Some(ok)
 }
 
 fn load_config(path: &Path) -> hiro_core::Config {

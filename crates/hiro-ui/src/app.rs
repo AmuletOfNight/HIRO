@@ -47,13 +47,12 @@ const LIVENESS_GRACE_MS: u128 = 500;
 
 const CSS: &str = r#"
 window {
-    background-color: #1c2128;
+    background-color: transparent;
 }
 #hiro-card {
-    background-color: #1c2128;
-    border: 1px solid #2d333b;
-    border-radius: 16px;
-    padding: 18px 26px;
+    background-color: rgba(11, 17, 28, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 28px;
 }
 #hiro-brand {
     color: #768390;
@@ -63,19 +62,21 @@ window {
 }
 #hiro-label {
     color: #c9d1d9;
-    font-size: 17px;
+    font-size: 20px;
+    font-weight: bold;
     text-align: center;
 }
 #hiro-hint {
-    color: #768390;
+    color: #ffd166;
     font-size: 14px;
+    text-align: center;
 }
 #hiro-meter-caption {
-    color: #768390;
-    font-size: 12px;
+    color: #d5d5d5;
+    font-size: 13px;
 }
 progressbar.hiro-meter > trough {
-    background-color: #2d333b;
+    background-color: rgba(255, 255, 255, 0.18);
     border-radius: 4px;
     min-height: 8px;
 }
@@ -84,30 +85,39 @@ progressbar.hiro-meter > trough > progress {
     min-height: 8px;
 }
 progressbar.hiro-meter-var > trough > progress { background-color: #ffd166; }
-progressbar.hiro-meter-mot > trough > progress { background-color: #4fc3f7; }
+progressbar.hiro-meter-mot > trough > progress { background-color: #7fb2f0; }
 progressbar.hiro-meter-ok > trough > progress { background-color: #66bb6a; }
 #hiro-approval-title {
-    color: #e6edf3;
+    color: #ffffff;
     font-size: 17px;
     font-weight: bold;
+    text-align: center;
 }
 #hiro-approval-sub {
-    color: #adbac7;
+    color: #ffd166;
     font-size: 14px;
+    text-align: center;
 }
 button.hiro-approval-btn {
-    border-radius: 8px;
+    border-radius: 14px;
     padding: 12px 0;
+    font-size: 15px;
     font-weight: bold;
     border: none;
 }
 button.hiro-allow {
-    background-color: #2ea043;
+    background-color: #2e7d32;
     color: #ffffff;
 }
+button.hiro-allow:hover {
+    background-color: #388e3c;
+}
 button.hiro-deny {
-    background-color: #da3633;
+    background-color: #b71c1c;
     color: #ffffff;
+}
+button.hiro-deny:hover {
+    background-color: #c62828;
 }
 "#;
 
@@ -144,8 +154,9 @@ pub struct App {
     window: gtk::Window,
     card: gtk::Box,
     body: gtk::Box,
-    content: gtk::Box,
+    content: gtk::Fixed,
     side: gtk::Box,
+    face_center_x: i32,
     status_label: gtk::Label,
     face: gtk::DrawingArea,
     meter_box: gtk::Box,
@@ -200,8 +211,9 @@ impl App {
             window: gtk::Window::new(gtk::WindowType::Toplevel),
             card: gtk::Box::new(gtk::Orientation::Vertical, 10),
             body: gtk::Box::new(gtk::Orientation::Vertical, 8),
-            content: gtk::Box::new(gtk::Orientation::Horizontal, 14),
+            content: gtk::Fixed::new(),
             side: gtk::Box::new(gtk::Orientation::Vertical, 8),
+            face_center_x: 0,
             status_label: gtk::Label::new(None),
             face: gtk::DrawingArea::new(),
             meter_box: gtk::Box::new(gtk::Orientation::Vertical, 4),
@@ -272,7 +284,7 @@ impl App {
         w.set_type_hint(gdk::WindowTypeHint::Dialog);
         w.set_accept_focus(false);
         w.set_resizable(false);
-        w.set_size_request(460, -1);
+        w.set_size_request(480, -1);
         w.set_opacity(0.0);
         {
             // Keep the card centered on the primary monitor whenever its
@@ -291,6 +303,10 @@ impl App {
 
         let card = &self.card;
         card.set_widget_name("hiro-card");
+        // Guaranteed breathing room around the card content (the CSS padding
+        // alone is unreliable if the stylesheet fails to load).
+        card.set_border_width(24);
+        card.set_spacing(12);
         w.add(card);
 
         let brand = gtk::Label::new(Some("HIRO"));
@@ -300,6 +316,7 @@ impl App {
         // Body (crossfaded as a unit on result transitions): the status
         // label on top, then the face with the liveness meters beside it.
         let body = &self.body;
+        body.set_spacing(12);
         self.status_label.set_widget_name("hiro-label");
         // Fill the card width so the text block keeps its size whether it
         // reads "Scanning your face…" or "✓ Verified (97%)"; text centres.
@@ -308,28 +325,33 @@ impl App {
         self.status_label.set_wrap(true);
         body.pack_start(&self.status_label, false, false, 0);
 
-        // Content row: animated face + side column (meters, hint).
-        let content = &self.content;
-        content.set_halign(gtk::Align::Center);
+        // Content area: a fixed-size container holding the animated face and
+        // the meter/hint side column. The smiley glides to the centre via
+        // explicit positioning (gtk::Fixed), so the card width never changes
+        // (GTK margins would grow the row and push the smiley off-centre).
         self.face.set_size_request(96, 96);
         {
             let face_app = self.rc();
             self.face.connect_draw(move |area, cr| {
-                let app = face_app.borrow();
-                draw_face(
-                    cr,
-                    area.allocated_width() as f64,
-                    area.allocated_height() as f64,
-                    app.face_state,
-                    app.sweep,
-                    app.breathe,
-                );
+                // try_borrow instead of borrow: a synchronous redraw can
+                // arrive while a transition timer holds the app borrowed
+                // mutably; panicking here would kill the process.
+                if let Ok(app) = face_app.try_borrow() {
+                    draw_face(
+                        cr,
+                        area.allocated_width() as f64,
+                        area.allocated_height() as f64,
+                        app.face_state,
+                        app.sweep,
+                        app.breathe,
+                    );
+                }
                 glib::Propagation::Proceed
             });
         }
-        content.pack_start(&self.face, false, false, 0);
 
         // Liveness meters.
+        self.meter_box.set_spacing(8);
         self.meter_box.pack_start(
             &self.meter_row("Scene motion", &self.variance_bar, "hiro-meter-var"),
             false,
@@ -344,27 +366,45 @@ impl App {
         );
 
         self.hint.set_widget_name("hiro-hint");
-        self.hint.set_xalign(0.0);
+        self.hint.set_xalign(0.5);
         let side = &self.side;
+        side.set_spacing(10);
         side.pack_start(&self.meter_box, false, false, 0);
         side.pack_start(&self.hint, false, false, 0);
-        content.pack_start(side, false, false, 0);
+
+        // Lay the face at the left and the side column on the right, keeping
+        // the total width (and therefore the card width) constant.
+        let content = &self.content;
+        content.set_halign(gtk::Align::Center);
+        let (_, side_nat) = side.preferred_size();
+        let side_w = side_nat.width.max(1);
+        let side_h = side_nat.height.max(1);
+        let content_w = 96 + 14 + side_w;
+        let content_h = 96.max(side_h);
+        content.set_size_request(content_w, content_h);
+        content.put(&self.face, 0, 0);
+        content.put(side, 96 + 14, 0);
+        self.face_center_x = ((content_w - 96) / 2).max(0);
 
         body.pack_start(content, false, false, 0);
         card.pack_start(body, false, false, 0);
 
         // Approval prompt.
+        self.approval_box.set_spacing(8);
         self.approval_title.set_widget_name("hiro-approval-title");
         self.approval_title.set_wrap(true);
         self.approval_sub.set_widget_name("hiro-approval-sub");
         self.approval_sub.set_wrap(true);
         self.approval_buttons.set_halign(gtk::Align::Fill);
-        self.approval_buttons.set_spacing(8);
+        self.approval_buttons.set_spacing(10);
+        self.approval_buttons.set_margin_top(6);
         for btn in [&self.allow_btn, &self.deny_btn] {
             btn.style_context().add_class("hiro-approval-btn");
             // Each button takes exactly half the dialog width, spanning the
             // full bottom of the card.
             btn.set_hexpand(true);
+            btn.set_margin_top(4);
+            btn.set_margin_bottom(4);
         }
         self.allow_btn.style_context().add_class("hiro-allow");
         self.deny_btn.style_context().add_class("hiro-deny");
@@ -482,6 +522,7 @@ impl App {
     // --- Scanning indicator ---
 
     fn enter_scanning(&mut self) {
+        log::info!("hiro-ui: enter_scanning state={}", self.state);
         self.state = "scanning".into();
         self.scan_started_at = Some(Instant::now());
         self.face_state = if self.enrolling {
@@ -638,7 +679,7 @@ impl App {
 
     fn stop_animations(&mut self) {
         if let Some(id) = self.anim_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
         self.sweep = 0.0;
         self.breathe = 1.0;
@@ -647,6 +688,7 @@ impl App {
     // --- Approval prompt ---
 
     fn show_approval(&mut self, ev: &StateEvent) {
+        log::info!("hiro-ui: show_approval state={}", self.state);
         self.cancel_result_timer();
         self.cancel_hide_timer();
         self.cancel_crossfade();
@@ -766,7 +808,7 @@ impl App {
 
     fn stop_approval_timer(&mut self) {
         if let Some(id) = self.approval_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
     }
 
@@ -814,6 +856,7 @@ impl App {
     // --- Results ---
 
     fn queue_result(&mut self, ev: &StateEvent) {
+        log::info!("hiro-ui: queue_result state={}", ev.state);
         let result = ResultInfo {
             state: ev.state.clone(),
             score: ev.score,
@@ -853,7 +896,7 @@ impl App {
         let rc = self.rc();
         self.result_timer = Some(glib::timeout_add_local(
             Duration::from_millis(wait),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 app.result_timer = None;
                 // The result may arrive while an approval prompt is up
@@ -866,14 +909,16 @@ impl App {
                 }
                 app.present_result();
                 ControlFlow::Break
-            },
+            }),
         ));
     }
 
     fn present_result(&mut self) {
         let Some(r) = self.pending_result.take() else {
+            log::warn!("hiro-ui: present_result called with no pending result");
             return;
         };
+        log::info!("hiro-ui: present_result state={} text=...", r.state);
         self.state = r.state.clone();
         self.stop_animations();
         // The meters/hint stay visible here; the in-place result transition
@@ -919,6 +964,12 @@ impl App {
             FaceState::Fail
         };
         self.show_window();
+        // Set the verdict text and colour immediately — it must always be
+        // visible, even if a transition timer is interrupted. The transitions
+        // below are purely visual (glide, fade, pulse).
+        self.status_label.set_text(&text);
+        self.face_state = face_state;
+        self.face.queue_draw();
         // If an approval prompt was up, fade it out and let the window
         // settle to the result size instead of snapping.
         if self.approval_box.is_visible() {
@@ -926,12 +977,12 @@ impl App {
         }
         // A scan that was showing its meter tracks morphs in place: the card
         // keeps its width, the bars fade out and the smiley glides to the
-        // centre while turning the result colour. A compact verdict (no scan
-        // happened) just crossfades and shrinks to fit.
+        // centre. A compact verdict (no scan happened) just pulses and
+        // shrinks to fit.
         if self.meter_box.is_visible() {
-            self.transition_to_result(text, face_state);
+            self.transition_to_result();
         } else {
-            self.crossfade_result(text, face_state);
+            self.crossfade_result();
             self.animate_to_natural_size();
         }
         self.schedule_hide(RESULT_MS);
@@ -942,7 +993,7 @@ impl App {
         let rc = self.rc();
         self.hide_timer = Some(glib::timeout_add_local(
             Duration::from_millis(ms),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 app.hide_timer = None;
                 if app.state != "success" && app.state != "failure" {
@@ -950,19 +1001,19 @@ impl App {
                 }
                 app.hide_window();
                 ControlFlow::Break
-            },
+            }),
         ));
     }
 
     fn cancel_result_timer(&mut self) {
         if let Some(id) = self.result_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
     }
 
     fn cancel_hide_timer(&mut self) {
         if let Some(id) = self.hide_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
     }
 
@@ -974,28 +1025,14 @@ impl App {
 
     fn show_window(&mut self) {
         self.cancel_fade();
-        if self.window.is_visible() {
-            self.window.set_opacity(1.0);
-            return;
+        // Show at full opacity and raise the window. Relying on a fade-in
+        // from opacity 0 proved unreliable for re-shows (the window could be
+        // left invisible); the card's content transitions provide the motion.
+        self.window.set_opacity(1.0);
+        if !self.window.is_visible() {
+            self.window.show();
+            self.window.present();
         }
-        self.window.show();
-        self.window.set_opacity(0.0);
-        let rc = self.rc();
-        let start = Instant::now();
-        self.fade_timer = Some(glib::timeout_add_local(
-            Duration::from_millis(FADE_STEP_MS),
-            move || {
-                let mut app = rc.borrow_mut();
-                let t = start.elapsed().as_secs_f64() / (FADE_IN_MS as f64 / 1000.0);
-                if t >= 1.0 {
-                    app.window.set_opacity(1.0);
-                    app.fade_timer = None;
-                    return ControlFlow::Break;
-                }
-                app.window.set_opacity(t);
-                ControlFlow::Continue
-            },
-        ));
     }
 
     fn hide_window(&mut self) {
@@ -1028,7 +1065,7 @@ impl App {
 
     fn cancel_fade(&mut self) {
         if let Some(id) = self.fade_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
     }
 
@@ -1056,7 +1093,7 @@ impl App {
         let start = Instant::now();
         self.resize_timer = Some(glib::timeout_add_local(
             Duration::from_millis(RESIZE_STEP_MS),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 let t = (start.elapsed().as_secs_f64() / (RESIZE_MS as f64 / 1000.0)).min(1.0);
                 let e = ease_out_quad(t);
@@ -1068,21 +1105,20 @@ impl App {
                     return ControlFlow::Break;
                 }
                 ControlFlow::Continue
-            },
+            }),
         ));
     }
 
     fn cancel_resize_animation(&mut self) {
         if let Some(id) = self.resize_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
     }
 
-    /// Crossfade the card body to a result: fade the old content out, swap
-    /// in the verdict text/face, fade back in. Matches the extension's
-    /// `_transitionToResult`; the window shrink happens in parallel via
-    /// `animate_to_natural_size`.
-    fn crossfade_result(&mut self, text: String, face_state: FaceState) {
+    /// Pulse the card body for a compact verdict (no scan / no meters): the
+    /// verdict text/colour was already set by `present_result`. The window
+    /// shrink happens in parallel via `animate_to_natural_size`.
+    fn crossfade_result(&mut self) {
         self.cancel_crossfade();
         // Compact verdicts (no scan / no meters): start from a clean layout.
         self.reset_result_layout();
@@ -1091,47 +1127,44 @@ impl App {
         let phase_start = Rc::new(RefCell::new(Instant::now()));
         self.crossfade_timer = Some(glib::timeout_add_local(
             Duration::from_millis(FADE_STEP_MS),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 let mut phase = phase.borrow_mut();
                 let mut phase_start = phase_start.borrow_mut();
                 if *phase == 0 {
-                    // Fade the old content out, then swap in the result.
+                    // Pulse the body down (never to 0).
                     let t = phase_start.elapsed().as_secs_f64()
                         / (FADE_OUT_MS as f64 / 1000.0);
                     if t < 1.0 {
-                        app.body.set_opacity(1.0 - t);
+                        app.body.set_opacity(1.0 - 0.65 * t);
                         return ControlFlow::Continue;
                     }
-                    app.body.set_opacity(0.0);
-                    app.status_label.set_text(&text);
-                    app.face_state = face_state;
-                    app.face.queue_draw();
+                    app.body.set_opacity(0.35);
                     // The verdict text is narrower than the scan label, so
-                    // re-ease to the final natural size after the swap.
+                    // re-ease to the final natural size.
                     app.animate_to_natural_size();
                     *phase = 1;
                     *phase_start = Instant::now();
                     ControlFlow::Continue
                 } else {
-                    // Fade the result in.
+                    // Pulse the body back up.
                     let t = phase_start.elapsed().as_secs_f64()
                         / (FADE_IN_MS as f64 / 1000.0);
                     if t < 1.0 {
-                        app.body.set_opacity(t);
+                        app.body.set_opacity(0.35 + 0.65 * t);
                         return ControlFlow::Continue;
                     }
                     app.body.set_opacity(1.0);
                     app.crossfade_timer = None;
                     ControlFlow::Break
                 }
-            },
+            }),
         ));
     }
 
     fn cancel_crossfade(&mut self) {
         if let Some(id) = self.crossfade_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
         self.body.set_opacity(1.0);
     }
@@ -1142,38 +1175,34 @@ impl App {
     /// result flow must keep the face position the approval already set.
     fn reset_result_layout(&mut self) {
         self.body.set_opacity(1.0);
-        self.content.set_size_request(-1, -1);
-        self.face.set_margin_start(0);
+        self.content.move_(&self.face, 0, 0);
         self.side.set_opacity(1.0);
     }
 
-    /// Freeze the content-row width (the card keeps the scan card's width),
-    /// fade the meters/hint out in place, and glide the smiley to the centre.
+    /// Fade the meters/hint out in place and glide the smiley to the centre.
     /// Shared by the approval and result transitions so the face ends up in
     /// the same place.
     fn settle_side_and_center_face(&mut self) {
         self.cancel_crossfade();
-        let (_, nat) = self.content.preferred_size();
-        let row_w = nat.width.max(96);
-        self.content.set_size_request(row_w, -1);
-        let dx = ((row_w as f64 - 96.0) / 2.0).round() as i32;
+        let target_x = self.face_center_x;
         let face = self.face.clone();
+        let content = self.content.clone();
         let side = self.side.clone();
         let start = Instant::now();
         self.crossfade_timer = Some(glib::timeout_add_local(
             Duration::from_millis(FADE_STEP_MS),
-            move || {
+            move || tick(|| {
                 let t = start.elapsed().as_secs_f64() / 0.28;
                 let e = ease_in_out_quad(t.min(1.0));
-                face.set_margin_start((dx as f64 * e).round() as i32);
+                content.move_(&face, (target_x as f64 * e).round() as i32, 0);
                 side.set_opacity(1.0 - e);
                 if t >= 1.0 {
-                    face.set_margin_start(dx);
+                    content.move_(&face, target_x, 0);
                     side.set_opacity(0.0);
                     return ControlFlow::Break;
                 }
                 ControlFlow::Continue
-            },
+            }),
         ));
     }
 
@@ -1189,7 +1218,7 @@ impl App {
         let duration = FADE_OUT_MS as f64 / 1000.0;
         self.approval_fade_timer = Some(glib::timeout_add_local(
             Duration::from_millis(FADE_STEP_MS),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 let t = start.elapsed().as_secs_f64() / duration;
                 if t >= 1.0 {
@@ -1202,81 +1231,75 @@ impl App {
                 }
                 app.approval_box.set_opacity(1.0 - t);
                 ControlFlow::Continue
-            },
+            }),
         ));
     }
 
     fn cancel_approval_fade(&mut self) {
         if let Some(id) = self.approval_fade_timer.take() {
-            id.remove();
+            unsafe { glib::ffi::g_source_remove(id.as_raw()); }
         }
         self.approval_box.set_opacity(1.0);
     }
 
     /// In-place morph of the scanning card to the verdict: the card keeps
-    /// its width (the meter rows stay in the layout and fade out), the label
-    /// crossfades to the result text, and the smiley glides to the centre
-    /// while the face_state swap (result colour) happens under a fade.
-    fn transition_to_result(&mut self, text: String, face_state: FaceState) {
+    /// its width (the meter rows stay in the layout and fade out), the smiley
+    /// glides to the centre, and the body does a quick pulse so the change
+    /// reads as smooth. The verdict text/colour is set by `present_result`.
+    fn transition_to_result(&mut self) {
         self.cancel_crossfade();
-        // Freeze the content-row width so the result card keeps the scan
-        // card's dimensions while the meters fade and the smiley slides.
-        let (_, nat) = self.content.preferred_size();
-        let row_w = nat.width.max(96);
-        self.content.set_size_request(row_w, -1);
-        let dx = ((row_w as f64 - 96.0) / 2.0).round() as i32;
+        let target_x = self.face_center_x;
+        // Start the glide from the smiley's current position (for an
+        // approval result it is already centred, so the glide is a no-op).
+        let from_x = self.face.allocation().x().max(0);
 
         let rc = self.rc();
         let phase = Rc::new(RefCell::new(0u8));
         let phase_start = Rc::new(RefCell::new(Instant::now()));
         let start = Rc::new(RefCell::new(Instant::now()));
         let face = self.face.clone();
-        // Start the glide from the smiley's current margin (for an approval
-        // result it is already centred, so the glide is a no-op).
-        let from_margin = self.face.margin_start();
+        let content = self.content.clone();
+        let side = self.side.clone();
         self.crossfade_timer = Some(glib::timeout_add_local(
             Duration::from_millis(FADE_STEP_MS),
-            move || {
+            move || tick(|| {
                 let mut app = rc.borrow_mut();
                 let mut phase = phase.borrow_mut();
                 let mut phase_start = phase_start.borrow_mut();
                 let start = start.borrow_mut();
-                // The slide runs continuously from the start (280 ms), so the
-                // smiley is still gliding while it fades back in.
+                // The glide runs continuously from the start (280 ms), and the
+                // meters fade out in step with it.
                 let tween_t = (start.elapsed().as_secs_f64() / 0.28).min(1.0);
-                let m = (from_margin as f64 + (dx - from_margin) as f64
-                    * ease_in_out_quad(tween_t)).round() as i32;
-                face.set_margin_start(m);
+                let e = ease_in_out_quad(tween_t);
+                let x = (from_x as f64 + (target_x - from_x) as f64 * e).round() as i32;
+                content.move_(&face, x, 0);
+                side.set_opacity(1.0 - e);
                 if *phase == 0 {
-                    // Fade the old content out (label + face + meters).
+                    // Pulse the body down (never to 0 — the verdict stays
+                    // readable if interrupted).
                     let t = phase_start.elapsed().as_secs_f64()
                         / (FADE_OUT_MS as f64 / 1000.0);
                     if t < 1.0 {
-                        app.body.set_opacity(1.0 - t);
+                        app.body.set_opacity(1.0 - 0.65 * t);
                         return ControlFlow::Continue;
                     }
-                    // Swap in the verdict; the meters are gone for good.
-                    app.body.set_opacity(0.0);
-                    app.status_label.set_text(&text);
-                    app.face_state = face_state;
-                    app.face.queue_draw();
-                    app.side.set_opacity(0.0);
+                    app.body.set_opacity(0.35);
                     *phase = 1;
                     *phase_start = Instant::now();
                     ControlFlow::Continue
                 } else {
-                    // Fade the verdict back in.
+                    // Pulse the body back up.
                     let t = phase_start.elapsed().as_secs_f64()
                         / (FADE_IN_MS as f64 / 1000.0);
                     if t < 1.0 {
-                        app.body.set_opacity(t);
+                        app.body.set_opacity(0.35 + 0.65 * t);
                         return ControlFlow::Continue;
                     }
                     app.body.set_opacity(1.0);
                     app.crossfade_timer = None;
                     ControlFlow::Break
                 }
-            },
+            }),
         ));
     }
 }
@@ -1286,6 +1309,21 @@ fn bar_fraction(value: f32, max: f32) -> f64 {
         return 0.0;
     }
     (value / max).clamp(0.0, 1.0) as f64
+}
+
+/// Run a timer body, catching panics so a UI bug can never kill the process
+/// (which would silently close the window and lose every later state).
+fn tick<F>(f: F) -> ControlFlow
+where
+    F: FnOnce() -> ControlFlow,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(cf) => cf,
+        Err(_) => {
+            log::error!("hiro-ui: timer callback panicked");
+            ControlFlow::Break
+        }
+    }
 }
 
 /// Ease-out-quad easing, the same shape as Clutter's `EASE_OUT_QUAD` used
@@ -1309,7 +1347,7 @@ fn ease_in_out_quad(t: f64) -> f64 {
 /// tween and retargets from the current value.
 fn animate_fraction(bar: &gtk::ProgressBar, target: f64, timer: &mut Option<glib::SourceId>) {
     if let Some(id) = timer.take() {
-        id.remove();
+        unsafe { glib::ffi::g_source_remove(id.as_raw()); }
     }
     let from = bar.fraction();
     if (from - target).abs() < 0.001 {

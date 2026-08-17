@@ -86,7 +86,11 @@ hiro-ui renders unless the \fBhiro-status@hiro\fR GNOME Shell extension
 reports enabled — that probe runs against the live shell, so it does not
 depend on desktop environment variables (\fIXDG_CURRENT_DESKTOP\fR and
 friends are frequently missing in systemd user units). \fIon\fR forces
-rendering and \fIoff\fR disables the in-session UI entirely.
+rendering — and disables the \fBhiro-status@hiro\fR extension at hiro-ui
+startup so it cannot double-render the same overlay — while \fIoff\fR
+disables the in-session UI entirely. Switching back to \fI"auto"\fR or
+\fI"off"\fR after a forced run re-enables the extension and hands control
+back to it.
 .SH RELOADING
 Apply changes with:
 .B hiro reload

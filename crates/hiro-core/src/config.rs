@@ -349,7 +349,9 @@ pub enum UiMode {
     /// extension enabled (which owns the UI there).
     #[default]
     Auto,
-    /// Always render, ignoring desktop/extension detection.
+    /// Always render, ignoring desktop/extension detection. `hiro-ui` also
+    /// disables the `hiro-status@hiro` GNOME Shell extension at startup so
+    /// the two UIs cannot double-render the same scan/approval overlay.
     On,
     /// Never render (rely on the GNOME extension, the secure console, or
     /// no UI at all).

@@ -136,7 +136,10 @@ active = "auto"
 
 - `off` — `hiro-ui` exits immediately (user wants no UI / relies on the
   extension or secure console).
-- `on` — render everything, ignoring detection (force).
+- `on` — render everything, ignoring detection (force). Also disables the
+  `hiro-status@hiro` extension at startup (best-effort) so it cannot
+  double-render the same overlay; a session-scoped marker lets a later
+  `auto`/`off` run re-enable the extension and hand control back.
 - `auto` (default) — at startup:
   1. Read `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION`. If it does **not**
      contain `GNOME` → active.
@@ -257,4 +260,5 @@ doctor` reads it today).
   Rejected.
 - **Daemon-side renderer exclusivity** (new protocol op to claim the
   approval renderer) — protocol/daemon surgery with no real benefit over
-  detection; revisit only if double-rendering reports surface.
+  detection. Double-rendering on GNOME is instead resolved client-side:
+  `[ui] active = "on"` disables the extension from `hiro-ui` (§6).

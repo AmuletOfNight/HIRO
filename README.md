@@ -154,7 +154,10 @@ flashes. It is installed and enabled by the package:
   against the live shell, so it works even when `hiro-ui` was started
   without the desktop session's environment variables); control it with the
   `[ui]` section of `/etc/hiro/config.toml`
-  (`active = "auto" | "on" | "off"`, default `auto`). See `man hiro-ui`,
+  (`active = "auto" | "on" | "off"`, default `auto`). `on` forces `hiro-ui`
+  and disables the `hiro-status@hiro` extension at startup so the two UIs
+  never double-render; switching back to `auto` or `off` re-enables the
+  extension and hands control back to it. See `man hiro-ui`,
   `man hiro.conf`.
 - Disable it entirely (e.g. you only want the secure-console approval
   dialog) with `[ui] active = "off"`.

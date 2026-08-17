@@ -5,8 +5,10 @@
 //! desktop, but defers to the GNOME Shell extension (`hiro-status@hiro`)
 //! when that extension is running — otherwise both UIs would render the same
 //! approval prompt. Detection uses environment hints, a `/proc` process
-//! probe, and a read-only `gnome-extensions info` query; it is advisory,
-//! never a security boundary.
+//! probe, and a `gnome-extensions` query; when the config forces the
+//! fallback (`[ui] active = "on"`) `hiro-ui` additionally *disables* the
+//! extension so it cannot double-render. All of this is advisory, never a
+//! security boundary.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -124,6 +126,88 @@ pub fn gnome_extension_enabled() -> bool {
         Err(_) => {
             // The probe hung (no D-Bus, stalled shell, ...). Kill it so no
             // stray GJS process lingers, and treat it as "no extension".
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            false
+        }
+    }
+}
+
+/// Disable the `hiro-status@hiro` GNOME Shell extension (best-effort).
+///
+/// Called by `hiro-ui` when `[ui] active = "on"` forces the fallback UI:
+/// the extension and `hiro-ui` both consume the daemon's state stream, so
+/// without this the shell overlay would render the same scan/approval
+/// prompt on top of the GTK card.
+///
+/// Returns `true` when the extension is off afterwards — it was disabled
+/// here, or was already off / not installed. Returns `false` when the
+/// `gnome-extensions` command is unavailable, hung, or errored, in which
+/// case the extension may still render. Never panics.
+pub fn gnome_extension_disable() -> bool {
+    // Nothing to do when the extension is already off or not installed: it
+    // cannot overlay hiro-ui, and probing first keeps the log quiet on
+    // machines that never had the extension.
+    if !gnome_extension_enabled() {
+        return true;
+    }
+    run_extension_command("disable")
+}
+
+/// Enable the `hiro-status@hiro` GNOME Shell extension (best-effort).
+///
+/// Called by `hiro-ui` when a forced (`[ui] active = "on"`) run previously
+/// disabled the extension and the config has since switched back to
+/// `auto`/`off`, handing control back to the first-class UI.
+///
+/// Returns `true` when the extension is on afterwards (it was enabled here
+/// or already was), `false` when the command is unavailable, hung, or
+/// errored. Never panics.
+pub fn gnome_extension_enable() -> bool {
+    if gnome_extension_enabled() {
+        return true;
+    }
+    run_extension_command("enable")
+}
+
+/// Run `gnome-extensions <action> hiro-status@hiro`, with the same timeout
+/// discipline as the enable probe so a wedged bus cannot stall UI startup.
+/// Returns whether the command exited successfully.
+fn run_extension_command(action: &str) -> bool {
+    let mut child = match Command::new("gnome-extensions")
+        .arg(action)
+        .arg("hiro-status@hiro")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let stdout = child.stdout.take();
+    let (tx, rx) = mpsc::channel::<()>();
+    let reader = std::thread::spawn(move || {
+        if let Some(mut out) = stdout {
+            let mut text = String::new();
+            let _ = out.read_to_string(&mut text);
+        }
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(EXTENSION_PROBE_TIMEOUT) {
+        Ok(()) => {
+            // The reader only finishes once the pipe hits EOF, so the child
+            // has exited by the time we get here; `wait` reaps it and its
+            // status says whether the command succeeded.
+            let _ = reader.join();
+            match child.wait() {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            }
+        }
+        Err(_) => {
+            // The probe hung (no D-Bus, stalled shell, ...). Kill it so no
+            // stray GJS process lingers, and report failure.
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();

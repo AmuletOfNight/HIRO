@@ -180,7 +180,9 @@ secure_dialog = "/usr/lib/hiro/hiro-approve"
 # by a systemd user unit that never inherited the desktop session's
 # XDG_CURRENT_DESKTOP / DESKTOP_SESSION variables — the extension owns the
 # UI there, so hiro-ui defers (exits).
-# active = "on": always render, ignoring desktop/extension detection.
+# active = "on": always render, ignoring desktop/extension detection. Also
+# disables the hiro-status@hiro extension at startup so the two UIs never
+# double-render; switching back to "auto"/"off" re-enables the extension.
 # active = "off": never render (rely on the extension, the secure console,
 # or no UI at all).
 active = "auto"

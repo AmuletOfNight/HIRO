@@ -570,6 +570,9 @@ fn doctor() {
                     println!("hiro-ui            : defers (extension owns the UI)");
                 } else {
                     println!("hiro-ui            : forced on by config");
+                    println!(
+                        "                     (start/restart hiro-ui to disable the extension)"
+                    );
                     print_ui_install_status();
                 }
             } else {
