@@ -498,7 +498,7 @@ fn doctor() {
     } else {
         println!("linux-enable-ir-emitter: NOT installed (install for emitter fallback)");
     }
-    let quirks = hiro_hw::quirks::QuirkDb::load(None);
+    let quirks = hiro_hw::quirks::QuirkDb::load(Some(std::path::Path::new("/etc/hiro/quirks.toml")));
     println!("built-in XU quirks: {}", quirks.len());
 
     println!();

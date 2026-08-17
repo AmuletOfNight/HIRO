@@ -30,6 +30,10 @@ install -Dm755 target/release/hirod            "$D/usr/sbin/hirod"
 install -Dm755 target/release/hiro             "$D/usr/bin/hiro"
 install -Dm755 target/release/hiro-ui          "$D/usr/bin/hiro-ui"
 install -Dm755 target/release/libpam_hiro.so   "$D/lib/$MULTIARCH/security/pam_hiro.so"
+# Secure-desktop approval dialog — the daemon spawns this via systemd-run
+# when approval.secure_desktop = true. Default approval.secure_dialog
+# points here, so keep the path in sync with crates/hiro-core config.rs.
+install -Dm755 target/release/hiro-approve     "$D/usr/lib/hiro/hiro-approve"
 install -Dm644 etc/hiro/config.toml.example    "$D/etc/hiro/config.toml.example"
 install -Dm644 crates/hiro-hw/quirks.toml      "$D/etc/hiro/quirks.toml"
 install -Dm644 packaging/systemd/hirod.service         "$D/lib/systemd/system/hirod.service"

@@ -1,9 +1,12 @@
 Name: HIRO face authentication
-Default: yes
+# Deliberately opt-in: installing the package must not silently switch on
+# face authentication for every common-auth service (sudo, su, login,
+# greeter, sshd, ...). Tick the box in `sudo pam-auth-update` to enable.
+Default: no
 Priority: 300
 Auth-Type: Primary
 Auth:
-	sufficient pam_hiro.so keyring
+	sufficient pam_hiro.so
 Session-Type: Additional
 Session:
 	optional pam_hiro.so

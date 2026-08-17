@@ -20,18 +20,42 @@ use crate::state::SharedDaemon;
 /// Maximum concurrent client connections. The daemon spawns a thread per
 /// connection, so this bounds thread/fd exhaustion by local callers (the
 /// socket is world-connectable by design).
-const MAX_CONNECTIONS: usize = 32;
+pub const MAX_CONNECTIONS: usize = 32;
+/// Per-uid cap on concurrent connections. Without it, a single local
+/// account could pin every server slot with idle `Op::Watch` streams (which
+/// live for as long as the subscriber reads) and permanently disable face
+/// authentication for everyone — new PAM clients would all receive
+/// "server busy" and fall back to passwords. With the cap, one account can
+/// hold at most a handful of slots and the rest stay available for other
+/// users.
+pub const MAX_CONNECTIONS_PER_UID: usize = 8;
+/// Hard caps on `Op::Watch` subscriptions: each one occupies a connection
+/// slot and fans out every broadcast, so bound them globally and per uid.
+pub const MAX_WATCHERS: usize = 16;
+pub const MAX_WATCHERS_PER_UID: usize = 4;
 /// Idle read timeout on a client connection: a connection that sends
 /// nothing for this long is closed instead of pinning a thread forever.
 const CONN_IDLE_TIMEOUT_SECS: i64 = 30;
 
-/// Guard that releases the connection-slot counter when the handler
-/// thread exits (normally or via a panic).
-struct ConnSlot(Arc<AtomicUsize>);
+/// Guard that releases the global and per-uid connection-slot counters when
+/// the handler thread exits (normally or via a panic).
+struct ConnSlot {
+    active: Arc<AtomicUsize>,
+    by_uid: Arc<std::sync::Mutex<std::collections::HashMap<u32, usize>>>,
+    uid: u32,
+}
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.active.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut map) = self.by_uid.lock() {
+            if let Some(c) = map.get_mut(&self.uid) {
+                *c -= 1;
+                if *c == 0 {
+                    map.remove(&self.uid);
+                }
+            }
+        }
     }
 }
 
@@ -63,12 +87,48 @@ pub fn serve(daemon: SharedDaemon, shutdown: Arc<AtomicBool>) -> Result<(), Stri
     log::info!("hirod listening on {}", path.display());
 
     let active = Arc::new(AtomicUsize::new(0));
+    let by_uid: Arc<std::sync::Mutex<std::collections::HashMap<u32, usize>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                    log::warn!("rejecting connection: server busy ({MAX_CONNECTIONS} max)");
+                // Resolve the caller identity before spending a slot so the
+                // per-uid cap can be enforced. The same SO_PEERCRED value is
+                // used for authorization inside handle_conn.
+                let uid = peer_credentials(&stream).map(|c| c.uid);
+                let admitted = match uid {
+                    Some(u) => match by_uid.lock() {
+                        Ok(mut map) => {
+                            let per_uid = map.get(&u).copied().unwrap_or(0);
+                            if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS
+                                || per_uid >= MAX_CONNECTIONS_PER_UID
+                            {
+                                false
+                            } else {
+                                active.fetch_add(1, Ordering::Relaxed);
+                                *map.entry(u).or_insert(0) += 1;
+                                true
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("rejecting connection: conn table poisoned");
+                            false
+                        }
+                    },
+                    None => {
+                        // No peer credentials (not expected on AF_UNIX):
+                        // enforce only the global cap.
+                        if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                            false
+                        } else {
+                            active.fetch_add(1, Ordering::Relaxed);
+                            true
+                        }
+                    }
+                };
+                if !admitted {
+                    log::warn!("rejecting connection: server busy (max {MAX_CONNECTIONS} connections)");
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.write_all(
                         serde_json::to_string(&Response::err(0, "server busy"))
@@ -81,8 +141,11 @@ pub fn serve(daemon: SharedDaemon, shutdown: Arc<AtomicBool>) -> Result<(), Stri
                     );
                     continue;
                 }
-                active.fetch_add(1, Ordering::Relaxed);
-                let slot = ConnSlot(active.clone());
+                let slot = ConnSlot {
+                    active: active.clone(),
+                    by_uid: by_uid.clone(),
+                    uid: uid.unwrap_or(u32::MAX),
+                };
                 let daemon = daemon.clone();
                 std::thread::spawn(move || {
                     let _slot = slot;
@@ -185,6 +248,26 @@ fn handle_watch(daemon: &SharedDaemon, writer: &mut UnixStream, caller: Caller) 
             Ok(w) => w,
             Err(_) => return,
         };
+        // Bound watch subscriptions: each occupies a connection slot for the
+        // lifetime of the subscriber and receives every broadcast. Without
+        // the caps a local account could open many watch streams to pin
+        // server slots and/or grow the fan-out set.
+        let per_uid = watchers
+            .iter()
+            .filter(|w| w.caller.uid == caller.uid)
+            .count();
+        if watchers.len() >= MAX_WATCHERS || per_uid >= MAX_WATCHERS_PER_UID {
+            let _ = writer.write_all(
+                serde_json::to_string(&Response::err(0, "too many watch subscribers"))
+                    .map(|mut s| {
+                        s.push('\n');
+                        s
+                    })
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            return;
+        }
         watchers.push(crate::state::Watcher { caller, tx });
     }
     if let Ok(json) = serde_json::to_string(&hiro_core::proto::StateEvent::idle()) {
@@ -248,11 +331,12 @@ fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
         };
         // Zeroize the serialized response: it may contain the plaintext
         // login password (keyring unlock), and must not linger in heap
-        // memory after the connection write.
-        let mut out = zeroize::Zeroizing::new(String::with_capacity(256));
-        out.push_str(&serde_json::to_string(&response).expect("response serializes"));
-        out.push('\n');
-        if writer.write_all(out.as_bytes()).is_err() {
+        // memory after the connection write. Serialize directly into the
+        // Zeroizing buffer so no intermediate un-wiped copy is produced.
+        let mut out = zeroize::Zeroizing::new(Vec::<u8>::with_capacity(256));
+        serde_json::to_writer(&mut *out, &response).expect("response serializes");
+        out.push(b'\n');
+        if writer.write_all(&out[..]).is_err() {
             break;
         }
     }

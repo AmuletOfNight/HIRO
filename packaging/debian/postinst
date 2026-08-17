@@ -17,10 +17,13 @@ case "$1" in
             fi
         fi
 
-        # PAM opt-in profile.
-        if command -v pam-auth-update >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive pam-auth-update --package
-        fi
+        # PAM opt-in profile. The profile ships with Default: no, so
+        # installing the package never silently enables face authentication;
+        # the admin opts in with `sudo pam-auth-update` (tick "HIRO face
+        # authentication"). We deliberately do not run `pam-auth-update
+        # --package` here, which would auto-apply package defaults.
+        # (prerm still disables the profile on removal if the admin enabled
+        # it interactively.)
 
         # polkit >= 127 sandbox compatibility.
         if [ -d /etc/systemd/system/polkit-agent-helper@.service.d ]; then :; else

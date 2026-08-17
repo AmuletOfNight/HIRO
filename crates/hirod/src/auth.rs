@@ -277,10 +277,14 @@ fn calibrate_threshold(
     camera: &mut CameraSession,
     pipeline: &dyn FacePipeline,
     templates: &[Embedding],
+    budget_cap: Option<Duration>,
 ) -> AuthResult<Option<f32>> {
     const TARGET_SAMPLES: usize = 12;
     const MIN_SAMPLES: usize = 3;
     const DEADLINE: Duration = Duration::from_secs(6);
+    // Calibration runs while enrollment already holds the camera; never let
+    // it extend the total hold past the user's remaining camera budget.
+    let deadline = DEADLINE.min(budget_cap.unwrap_or(DEADLINE));
 
     crate::state::broadcast_state(
         daemon,
@@ -307,7 +311,7 @@ fn calibrate_threshold(
 
     let mut scores: Vec<f32> = Vec::with_capacity(TARGET_SAMPLES);
     let start = Instant::now();
-    while scores.len() < TARGET_SAMPLES && start.elapsed() < DEADLINE {
+    while scores.len() < TARGET_SAMPLES && start.elapsed() < deadline {
         let frame = match camera.next_frame(Duration::from_millis(250)) {
             Ok(Some(f)) => f,
             Ok(None) => continue,
@@ -474,7 +478,7 @@ pub fn verify(
             // Allow/Disallow decision before the action is granted. Login
             // screens bypass the prompt because the user triggers them
             // themselves.
-            if result.matched && approval_required(daemon, service) {
+            if result.matched && approval_required(daemon, service, caller) {
                 let cfg = daemon
                     .cfg
                     .read()
@@ -677,7 +681,11 @@ fn verify_inner(
         });
     }
 
-    let mut camera = daemon.camera_acquire(Some(user))?;
+    let mut camera = daemon.camera_acquire(Some(user), deadline)?;
+    // The per-user camera budget caps how long this request may hold the
+    // shared camera, even below the request's own deadline (a queued
+    // concurrent request may have reserved most of the budget already).
+    let deadline = camera.budget_cap().map_or(deadline, |cap| deadline.min(cap));
 
     if !allow_camera_change {
         let current = camera_binding(&camera);
@@ -895,7 +903,13 @@ fn verify_inner(
 /// Whether an authentication request must pause for an explicit
 /// Allow/Disallow decision after the face scan: enabled and the service is
 /// not one the user triggered themselves (login screens, `hiro test`).
-fn approval_required(daemon: &SharedDaemon, service: &str) -> bool {
+///
+/// The service name is caller-supplied, so a bypass-listed service is only
+/// trusted to skip the prompt when the caller is root — the real PAM login
+/// stacks run as root. A same-uid process claiming "gdm-password" must not
+/// get to choose the security behaviour; the one exemption is the
+/// designated self-test service `hiro test`, whose verdict grants nothing.
+fn approval_required(daemon: &SharedDaemon, service: &str, caller: Caller) -> bool {
     let cfg = match daemon.cfg.read() {
         Ok(c) => c.clone(),
         Err(_) => return false,
@@ -903,7 +917,16 @@ fn approval_required(daemon: &SharedDaemon, service: &str) -> bool {
     if !cfg.approval.enabled {
         return false;
     }
-    !cfg.approval.bypass_services.iter().any(|s| s == service)
+    if cfg
+        .approval
+        .bypass_services
+        .iter()
+        .any(|s| s == service)
+        && (caller.is_root() || service == "hiro-test")
+    {
+        return false;
+    }
+    true
 }
 
 enum ApprovalVerdict {
@@ -1066,7 +1089,7 @@ fn run_approval_phase(
     // Keep watching the user for the rest of the window. This phase runs
     // only after a real face match for the caller's own authorized request,
     // so it is exempt from the per-user camera budget.
-    let mut camera = match daemon.camera_acquire(None) {
+    let mut camera = match daemon.camera_acquire(None, window) {
         Ok(c) => c,
         Err(_) => {
             remove_approval(daemon, id);
@@ -1693,7 +1716,7 @@ fn enroll_inner(
     }
 
     let mut camera = daemon
-        .camera_acquire(Some(user))
+        .camera_acquire(Some(user), Duration::from_secs(60))
         .map_err(|e| e.to_string())?;
 
     // Record the camera-pinning binding (USB identity + driver + sysfs
@@ -1750,6 +1773,11 @@ fn enroll_inner(
     let mut rejected = 0usize;
     let mut primary_reject: Option<&'static str> = None;
     let deadline = Duration::from_secs(60);
+    // The per-user camera budget caps how long enrollment may hold the
+    // shared camera: even a request that would run the full 60 s window is
+    // cut at the user's remaining allowance, so one account cannot pin the
+    // camera and starve every other user's face auth.
+    let deadline = camera.budget_cap().map_or(deadline, |cap| deadline.min(cap));
     // If no face is ever detected, do not hold the camera for the full
     // window: fail fast so an absent/stale enrollment cannot monopolise the
     // camera (which would block every other user's face auth).
@@ -1961,6 +1989,7 @@ fn enroll_inner(
             .map(|t| t.embedding.clone())
             .collect();
         calibrate_templates.extend(candidates.iter().map(|(e, _)| e.clone()));
+        let calib_cap = camera.budget_cap();
         match calibrate_threshold(
             daemon,
             user,
@@ -1968,6 +1997,7 @@ fn enroll_inner(
             &mut camera,
             &**pipeline,
             &calibrate_templates,
+            calib_cap,
         ) {
             Ok(Some(t)) => calibrated_threshold = Some(t),
             Ok(None) => log::debug!("threshold calibration skipped: not enough usable frames"),
@@ -2698,7 +2728,10 @@ mod tests {
     }
 
     /// Non-login services must pause for an explicit decision after a
-    /// confident match; login screens and `hiro test` stay instant.
+    /// confident match; login screens and `hiro test` stay instant. The
+    /// bypass list is honoured only for root callers (the real PAM login
+    /// stacks) — a same-uid process must not be able to claim a bypass
+    /// service to skip the gate on its own request.
     #[test]
     fn approval_required_flags_non_login_services() {
         let daemon = test_daemon();
@@ -2706,16 +2739,22 @@ mod tests {
             let mut cfg = daemon.cfg.write().unwrap();
             cfg.approval.enabled = true;
         }
-        assert!(approval_required(&daemon, "sudo"));
-        assert!(approval_required(&daemon, "su"));
-        assert!(!approval_required(&daemon, "gdm-password"));
-        assert!(!approval_required(&daemon, "lightdm"));
-        assert!(!approval_required(&daemon, "hiro-test"));
+        let root = Caller { uid: 0, pid: 1 };
+        let user = Caller { uid: 1000, pid: 2 };
+        assert!(approval_required(&daemon, "sudo", root));
+        assert!(approval_required(&daemon, "su", root));
+        assert!(!approval_required(&daemon, "gdm-password", root));
+        assert!(!approval_required(&daemon, "lightdm", root));
+        assert!(!approval_required(&daemon, "hiro-test", root));
+        // Same-uid callers cannot claim a bypass-listed service...
+        assert!(approval_required(&daemon, "gdm-password", user));
+        // ...but the designated self-test service stays exempt.
+        assert!(!approval_required(&daemon, "hiro-test", user));
         {
             let mut cfg = daemon.cfg.write().unwrap();
             cfg.approval.enabled = false;
         }
-        assert!(!approval_required(&daemon, "sudo"));
+        assert!(!approval_required(&daemon, "sudo", root));
     }
 
     /// A sudo-style request parks after the match and completes only once
