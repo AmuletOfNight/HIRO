@@ -68,12 +68,12 @@ impl TpmKeyManager {
 }
 
 impl KeyManager for TpmKeyManager {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        aead_seal(&self.key[..], plaintext)
+    fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        aead_seal(&self.key[..], aad, plaintext)
     }
 
-    fn unseal(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        aead_unseal(&self.key[..], ciphertext)
+    fn unseal(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        aead_unseal(&self.key[..], aad, ciphertext)
     }
 
     fn tpm_available(&self) -> bool {

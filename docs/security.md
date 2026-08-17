@@ -106,6 +106,14 @@ the templates, so "clear then re-enroll" always starts fresh.
     touches disk and unsealing only succeeds on this machine's TPM.
   - **Software fallback**: a root-only keyfile (`/var/lib/hiro/hiro.key`,
     mode 0600), used automatically when no TPM 2.0 is present.
+- **Context-bound ciphertexts**: every blob's GCM tag covers the owning
+  user name as associated data, so a ciphertext copied into another
+  account's row (template substitution by an attacker who can modify the
+  database) fails to unseal. The wire format is versioned
+  (`0x01 || nonce || ciphertext`); blobs written before this binding are
+  **refused on read** — the record reads as undecryptable and the user
+  re-enrolls — rather than being accepted in a way that would re-open the
+  substitution hole.
 - Decryption happens in-memory, per request, in the daemon only.
 - Blob format documented in `crates/hiro-tpm/src/tpm.rs`; no PCR binding
   by default (firmware updates must not lock users out), a deliberate
@@ -126,6 +134,13 @@ the templates, so "clear then re-enroll" always starts fresh.
   (default 30 s).
 - Failures from *any* service (sudo, lock, GDM) share the same counters,
   since the daemon keys by user.
+- **Per-user camera budget**: the camera is a single shared device, so a
+  user is additionally limited to `security.camera_budget_secs`
+  (default 15) of camera-held time per `camera_budget_window_secs`
+  (default 60). A single account cannot monopolise the camera and block
+  every other user's face auth by chaining verify/enroll requests. The
+  action-approval phase (which runs only after a real face match) is
+  exempt.
 
 ### IPC and authorization
 
@@ -201,12 +216,15 @@ silently just because the camera recognizes the user.
   `hiro-approve` dialog know, and `Op::Approve` is honoured only when the
   caller is root *and* presents that secret. A compromised session — even
   one that can watch the approval events — cannot decide; it can only see
-  the prompt and wait. (Non-root processes cannot read a root process's
-  argv, so the secret on the dialog's command line stays private.) With
-  the in-session prompt (`secure_desktop` off), the decision lives in the
-  user's session by design, so any process running as that user can click
-  Allow — that is inherent to rendering the prompt in the session, and is
-  why `secure_desktop` exists for the strong guarantee.
+  the prompt and wait. The secret is delivered to the dialog through a
+  root-only file (mode 0600, unlinked after read) rather than its command
+  line — a root process's argv is world-readable on default Linux
+  (`/proc/<pid>/cmdline` is 0444 without `hidepid`), and `systemd-run`
+  records the ExecStart line, so argv would leak the secret to any local
+  process. With the in-session prompt (`secure_desktop` off), the decision
+  lives in the user's session by design, so any process running as that
+  user can click Allow — that is inherent to rendering the prompt in the
+  session, and is why `secure_desktop` exists for the strong guarantee.
 
 ### After-reboot password gate
 
@@ -226,8 +244,10 @@ until the account has been logged into since the last reboot
 - State is persisted in SQLite keyed by the kernel boot id
   (`/proc/sys/kernel/random/boot_id`), so daemon restarts mid-boot
   (suspend/resume, crashes) do not reset it; a real reboot prunes it.
-- Authorization applies as usual: only root or the user themselves can
-  record a login for an account.
+- Arming is **root-only**: `Op::Login` is honoured only for root callers,
+  which is who the greeter/login PAM session hooks run as. A process
+  running as the user can never arm face auth for an account, so the gate
+  cannot be silently bypassed by malware in a session.
 - Trade-off: anyone able to establish a session for a user during a boot
   (e.g. root, or passwordless/auto-login configured by the administrator)
   arms that user's face auth without a typed password. That matches the

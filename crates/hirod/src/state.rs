@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::ops::{Deref, DerefMut};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -12,6 +13,7 @@ use hiro_hw::quirks::QuirkDb;
 use hiro_store::Store;
 use hiro_tpm::KeyManager;
 
+use crate::auth::{AuthError, AuthResult};
 use crate::camera::CameraSession;
 use crate::policy::{Caller, Policy};
 
@@ -99,18 +101,61 @@ pub struct Watcher {
     pub tx: SyncSender<String>,
 }
 
+/// A held camera session with automatic release on drop and per-user
+/// budget accounting, so a single local user cannot monopolise the camera
+/// (blocking every other user's face auth) by chaining long verify/enroll
+/// requests.
+///
+/// Acquired via [`Daemon::camera_acquire`]; dropping the guard releases the
+/// camera *and* records the hold duration against the caller's rolling
+/// budget. `user` is `None` for the approval phase, which follows a real
+/// face match and is exempt from the quota (denying a matched request
+/// because a quota was already spent would be hostile to legitimate users).
+pub struct CameraGuard<'a> {
+    camera: std::sync::MutexGuard<'a, CameraSession>,
+    daemon: &'a Daemon,
+    user: Option<String>,
+    started: Instant,
+}
+
+impl Deref for CameraGuard<'_> {
+    type Target = CameraSession;
+    fn deref(&self) -> &CameraSession {
+        &self.camera
+    }
+}
+
+impl DerefMut for CameraGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CameraSession {
+        &mut self.camera
+    }
+}
+
+impl Drop for CameraGuard<'_> {
+    fn drop(&mut self) {
+        self.camera.release();
+        if let Some(user) = &self.user {
+            if let Ok(mut policy) = self.daemon.policy.lock() {
+                policy.record_camera_time(user, self.started.elapsed());
+            }
+        }
+    }
+}
+
 /// How many pending events a watcher may buffer before it is considered
 /// too slow and dropped. Scanning/enrollment broadcast a few events per
 /// second; 64 comfortably covers the burst while bounding memory.
 pub const WATCH_BUFFER: usize = 64;
 
 /// Fill `buf` from the kernel CSPRNG. `/dev/urandom` is always available on
-/// Linux; if a read ever fails the buffer stays zeroed.
+/// Linux; a failure is a system-level fault, and proceeding with zeros
+/// would silently produce guessable approval ids, pin secrets, and
+/// approval secrets — so it is a hard error (consistent with `hiro-tpm`).
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
+    let mut f = std::fs::File::open("/dev/urandom").expect("cannot open /dev/urandom");
+    f.read_exact(&mut buf)
+        .expect("cannot read from /dev/urandom");
     buf
 }
 
@@ -236,6 +281,39 @@ impl Daemon {
             config_path: opts.config_path,
             started_at: std::time::Instant::now(),
         }))
+    }
+
+    /// Acquire the camera on behalf of `user`, enforcing the per-user
+    /// rolling camera-time budget so a single account cannot hold the
+    /// camera indefinitely and starve every other user's face auth.
+    ///
+    /// The returned [`CameraGuard`] releases the camera and records the
+    /// hold duration on drop (including panic paths). Pass `user = None`
+    /// to skip the budget (used by the action-approval phase, which runs
+    /// only after a real face match for an authorized request).
+    pub fn camera_acquire(&self, user: Option<&str>) -> AuthResult<CameraGuard<'_>> {
+        if let Some(u) = user {
+            let mut policy = self
+                .policy
+                .lock()
+                .map_err(|_| AuthError::Internal("policy lock poisoned".into()))?;
+            if !policy.camera_budget_check(u) {
+                return Err(AuthError::RateLimited);
+            }
+        }
+        let mut camera = self
+            .camera
+            .lock()
+            .map_err(|_| AuthError::Internal("camera lock poisoned".into()))?;
+        camera
+            .acquire()
+            .map_err(|e| AuthError::Camera(e.to_string()))?;
+        Ok(CameraGuard {
+            camera,
+            daemon: self,
+            user: user.map(str::to_string),
+            started: Instant::now(),
+        })
     }
 
     /// Reload the configuration file. Rebuilds the pipeline when the

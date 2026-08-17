@@ -249,6 +249,15 @@ pub struct SecurityConfig {
     /// persisted keyed by kernel boot id so daemon restarts (suspend/
     /// resume, crashes) do not reset it mid-boot.
     pub require_password_after_boot: bool,
+    /// Rolling per-user camera-time budget (seconds). The daemon enforces
+    /// that a single user holds the camera for at most this much time per
+    /// `camera_budget_window_secs`, so one account cannot monopolise the
+    /// global camera and block every other user's face auth. Zero disables
+    /// the budget.
+    pub camera_budget_secs: u64,
+    /// The rolling window over which `camera_budget_secs` is enforced.
+    /// Zero disables the budget.
+    pub camera_budget_window_secs: u64,
 }
 
 impl Default for SecurityConfig {
@@ -260,6 +269,11 @@ impl Default for SecurityConfig {
             max_templates_per_user: 16,
             allow_camera_change: false,
             require_password_after_boot: true,
+            // 15 camera-seconds per minute per user: generous for genuine
+            // use (a normal verify is a few seconds), tight enough that a
+            // single attacker cannot hold the camera most of the time.
+            camera_budget_secs: 15,
+            camera_budget_window_secs: 60,
         }
     }
 }

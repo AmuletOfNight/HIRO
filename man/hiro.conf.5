@@ -34,10 +34,13 @@ failures). Set \fIauto_threshold = false\fR to rely on the global
 \fImatch_threshold\fR alone.
 .TP
 .B [security]
-Rate limiting, lockout, per-user template limit, camera-pinning policy, and
-the after-reboot password gate (\fIrequire_password_after_boot\fR, default
+Rate limiting, lockout, per-user template limit, camera-pinning policy, the
+after-reboot password gate (\fIrequire_password_after_boot\fR, default
 true: face auth only works for users who have logged in since the last
-reboot).
+reboot, armed only by the root PAM session hook), and the per-user camera
+budget (\fIcamera_budget_secs\fR / \fIcamera_budget_window_secs\fR,
+default 15s/60s: a single account cannot monopolise the camera and block
+other users' face auth).
 .TP
 .B [storage]
 Template database and encryption key paths.

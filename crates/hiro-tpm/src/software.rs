@@ -17,9 +17,11 @@ pub struct SoftwareKeyManager {
 impl SoftwareKeyManager {
     /// Load the data key from `path` (creating nothing).
     pub fn load(path: &Path) -> Result<Self> {
-        let data = read_keyfile(path)?;
+        let mut data = read_keyfile(path)?;
         let mut key = [0u8; 32];
         key.copy_from_slice(&data);
+        // Zeroize the temporary copy before it is freed.
+        data.fill(0);
         Ok(Self {
             key: Zeroizing::new(key),
         })
@@ -45,12 +47,12 @@ impl SoftwareKeyManager {
 }
 
 impl KeyManager for SoftwareKeyManager {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        aead_seal(&self.key[..], plaintext)
+    fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        aead_seal(&self.key[..], aad, plaintext)
     }
 
-    fn unseal(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        aead_unseal(&self.key[..], ciphertext)
+    fn unseal(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+        aead_unseal(&self.key[..], aad, ciphertext)
     }
 
     fn tpm_available(&self) -> bool {

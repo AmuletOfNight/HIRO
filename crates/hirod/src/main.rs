@@ -83,13 +83,15 @@ fn main() {
     builder.format_timestamp_millis();
     builder.init();
 
-    if args.init_keys {
-        init_keys(&cfg);
-    }
-
+    // Every operational mode (including --init-keys, which creates the
+    // encryption key file and template database) requires root.
     if !nix::unistd::geteuid().is_root() {
         eprintln!("hirod must run as root");
         std::process::exit(1);
+    }
+
+    if args.init_keys {
+        init_keys(&cfg);
     }
 
     // Secure-desktop mode depends on the hiro-approve helper. Warn loudly at

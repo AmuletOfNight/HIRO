@@ -116,6 +116,15 @@ impl Store {
             "#,
         )?;
         self.migrate()?;
+        // Bounded audit retention: the events mirror is the daemon's
+        // journal backup, and journald rotates the primary copy. Without a
+        // prune, the table grows forever — a slow local disk-fill vector.
+        // (The journal keeps the authoritative, longer-lived trail.)
+        const AUDIT_RETENTION_DAYS: i64 = 365;
+        let _ = self.conn.execute(
+            "DELETE FROM events WHERE ts < unixepoch() - ?1",
+            params![AUDIT_RETENTION_DAYS * 86_400],
+        )?;
         Ok(())
     }
 

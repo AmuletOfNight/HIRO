@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
 use hiro_core::{CoreError, Result};
@@ -30,15 +30,29 @@ pub use software::SoftwareKeyManager;
 pub use tpm::TpmKeyManager;
 
 const NONCE_LEN: usize = 12;
+/// Marks the AAD-bound AEAD wire format:
+/// `0x01 || nonce(12) || AES-256-GCM ciphertext`, where the GCM
+/// authentication tag covers `aad`.
+///
+/// Every ciphertext is bound to its *context* (the owning user name) so a
+/// blob recorded for one account cannot be copied into another account's
+/// row and still decrypt — closing the template-substitution path for an
+/// attacker who can modify the database. The version byte makes the format
+/// self-describing; legacy (pre-AAD) blobs are refused on read so a
+/// downgraded blob can never re-open the substitution hole.
+const AEAD_VERSION_BYTE: u8 = 0x01;
 
 /// Seal/unseal interface for template ciphertext.
 ///
 /// The wire format produced by [`KeyManager::seal`] is
-/// `nonce(12) || AES-256-GCM ciphertext`, so implementations only need to
-/// protect the data key; the AEAD construction is shared.
+/// `0x01 || nonce(12) || AES-256-GCM ciphertext`, where the GCM
+/// authentication tag covers `aad`. Callers MUST pass the ownership
+/// context (e.g. the user name) so ciphertexts are not interchangeable
+/// between contexts. Implementations only need to protect the data key;
+/// the AEAD construction is shared.
 pub trait KeyManager: Send + Sync {
-    fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
-    fn unseal(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+    fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>>;
+    fn unseal(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>>;
     /// Whether a hardware TPM backs the data key.
     fn tpm_available(&self) -> bool;
     fn kind(&self) -> &'static str;
@@ -78,28 +92,39 @@ pub fn create(key_path: &Path) -> Result<Box<dyn KeyManager>> {
 }
 
 /// AEAD helpers shared by all key managers.
-pub(crate) fn aead_seal(key_bytes: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn aead_seal(key_bytes: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes));
     let mut nonce_bytes = [0u8; NONCE_LEN];
     fill_random(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, Payload { msg: plaintext, aad })
         .map_err(|_| CoreError::internal("AES-GCM encryption failed"))?;
-    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
+    out.push(AEAD_VERSION_BYTE);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     Ok(out)
 }
 
-pub(crate) fn aead_unseal(key_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    if ciphertext.len() <= NONCE_LEN {
+pub(crate) fn aead_unseal(key_bytes: &[u8], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    if ciphertext.len() < 1 + NONCE_LEN + 16 {
         return Err(CoreError::invalid("ciphertext too short"));
     }
+    if ciphertext[0] != AEAD_VERSION_BYTE {
+        // Refuse legacy (pre-AAD) blobs outright: they cannot be
+        // authenticated to a context, so accepting them would let an
+        // attacker strip the version byte and substitute ciphertexts
+        // between users. Fails closed — the affected record reads as
+        // undecryptable and the user re-enrolls.
+        return Err(CoreError::invalid(
+            "ciphertext is not context-bound (legacy format); re-enroll to upgrade",
+        ));
+    }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key_bytes));
-    let (nonce_bytes, ct) = ciphertext.split_at(NONCE_LEN);
+    let (nonce_bytes, ct) = (&ciphertext[1..1 + NONCE_LEN], &ciphertext[1 + NONCE_LEN..]);
     cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ct)
+        .decrypt(Nonce::from_slice(nonce_bytes), Payload { msg: ct, aad })
         .map_err(|_| CoreError::invalid("AES-GCM decryption failed: wrong key or tampered data"))
 }
 
@@ -172,29 +197,42 @@ mod tests {
     fn aead_roundtrip() {
         let key = [7u8; 32];
         let msg = b"hello, templates";
-        let ct = aead_seal(&key, msg).unwrap();
-        assert_eq!(ct.len(), NONCE_LEN + msg.len() + 16);
-        assert_eq!(aead_unseal(&key, &ct).unwrap(), msg);
+        let ct = aead_seal(&key, b"alice", msg).unwrap();
+        assert_eq!(ct.len(), 1 + NONCE_LEN + msg.len() + 16);
+        assert_eq!(aead_unseal(&key, b"alice", &ct).unwrap(), msg);
     }
 
     #[test]
     fn aead_tamper_detected() {
         let key = [7u8; 32];
-        let mut ct = aead_seal(&key, b"secret").unwrap();
+        let mut ct = aead_seal(&key, b"alice", b"secret").unwrap();
         let last = ct.len() - 1;
         ct[last] ^= 0x01;
-        assert!(aead_unseal(&key, &ct).is_err());
+        assert!(aead_unseal(&key, b"alice", &ct).is_err());
     }
 
     #[test]
     fn aead_wrong_key_detected() {
-        let ct = aead_seal(&[1u8; 32], b"secret").unwrap();
-        assert!(aead_unseal(&[2u8; 32], &ct).is_err());
+        let ct = aead_seal(&[1u8; 32], b"alice", b"secret").unwrap();
+        assert!(aead_unseal(&[2u8; 32], b"alice", &ct).is_err());
     }
 
     #[test]
     fn aead_short_input_rejected() {
-        assert!(aead_unseal(&[1u8; 32], b"tiny").is_err());
+        assert!(aead_unseal(&[1u8; 32], b"alice", b"tiny").is_err());
+    }
+
+    /// The whole point of context binding: a blob sealed for one context
+    /// must never decrypt under another, so a ciphertext copied between
+    /// users (or stripped of its AAD context) cannot be substituted.
+    #[test]
+    fn aead_wrong_aad_detected() {
+        let key = [7u8; 32];
+        let ct = aead_seal(&key, b"alice", b"template-bytes").unwrap();
+        assert!(aead_unseal(&key, b"bob", &ct).is_err());
+        // And a downgraded/legacy blob (no version byte) is refused too.
+        let legacy = &ct[1..];
+        assert!(aead_unseal(&key, b"alice", legacy).is_err());
     }
 
     #[test]
@@ -203,11 +241,12 @@ mod tests {
         let path = dir.path().join("hiro.key");
         let km = SoftwareKeyManager::create(&path).unwrap();
         assert!(!km.tpm_available());
-        let ct = km.seal(b"template-bytes").unwrap();
-        assert_eq!(km.unseal(&ct).unwrap(), b"template-bytes");
+        let ct = km.seal(b"alice", b"template-bytes").unwrap();
+        assert_eq!(km.unseal(b"alice", &ct).unwrap(), b"template-bytes");
+        assert!(km.unseal(b"bob", &ct).is_err(), "AAD must bind the owner");
 
         let km2 = SoftwareKeyManager::load(&path).unwrap();
-        assert_eq!(km2.unseal(&ct).unwrap(), b"template-bytes");
+        assert_eq!(km2.unseal(b"alice", &ct).unwrap(), b"template-bytes");
     }
 
     #[test]

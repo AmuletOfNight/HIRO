@@ -103,9 +103,11 @@ fn load_templates(daemon: &SharedDaemon, user: &str) -> AuthResult<Vec<LoadedTem
         .map_err(|e| AuthError::Internal(format!("template lookup failed: {e}")))?;
     let mut out = Vec::new();
     for row in rows {
+        // Decrypt bound to the owning user so a ciphertext copied from
+        // another account's row (template substitution) fails to unseal.
         let plain = daemon
             .km
-            .unseal(&row.ciphertext)
+            .unseal(user.as_bytes(), &row.ciphertext)
             .map_err(|e| AuthError::Internal(format!("template decryption failed: {e}")))?;
         match Embedding::from_bytes(&row.model, row.dim, &plain) {
             Some(emb) => out.push(LoadedTemplate {
@@ -168,10 +170,17 @@ pub fn record_login(
     user: &str,
     service: &str,
 ) -> AuthResult<()> {
-    let uid = target_uid(user)?;
-    if !authorize(caller, Some(uid)) {
+    // The account must exist (unknown users are rejected even by root).
+    let _uid = target_uid(user)?;
+    // Root-only: greeter/login PAM session stacks run as root, and arming
+    // face auth for a boot must be tied to an actual PAM session open —
+    // not to any same-uid process claiming a login. Before this gate, any
+    // process running as the user could arm their own face auth without a
+    // password, silently defeating the after-reboot password gate.
+    if !caller.is_root() {
         return Err(AuthError::Denied(format!(
-            "caller uid {} may not record a login for {user}",
+            "caller uid {} may not record a login for {user}: \
+             only root (the PAM session hook) may arm face auth",
             caller.uid
         )));
     }
@@ -191,7 +200,7 @@ pub fn record_login(
             &store,
             Some(user),
             "login",
-            &format!("service={service} boot={}", boot.boot_id),
+            &format!("service={service} boot={} caller_uid={}", boot.boot_id, caller.uid),
         );
     }
     Ok(())
@@ -668,13 +677,7 @@ fn verify_inner(
         });
     }
 
-    let mut camera = daemon
-        .camera
-        .lock()
-        .map_err(|_| AuthError::Internal("camera lock poisoned".into()))?;
-    camera
-        .acquire()
-        .map_err(|e| AuthError::Camera(e.to_string()))?;
+    let mut camera = daemon.camera_acquire(Some(user))?;
 
     if !allow_camera_change {
         let current = camera_binding(&camera);
@@ -918,6 +921,13 @@ fn remove_approval(daemon: &SharedDaemon, id: u64) {
     if let Ok(mut approvals) = daemon.approvals.lock() {
         approvals.remove(&id);
     }
+    // Best-effort: drop any leftover secret file for this approval (the
+    // dialog normally unlinks it after reading).
+    if let Ok(cfg) = daemon.cfg.read() {
+        if let Some(dir) = cfg.daemon.socket_path.parent() {
+            let _ = std::fs::remove_file(dir.join(format!("approve-{id}.secret")));
+        }
+    }
 }
 
 /// (Re-)broadcast the approval prompt so the status indicator can show (or
@@ -1053,19 +1063,16 @@ fn run_approval_phase(
         );
     }
 
-    // Keep watching the user for the rest of the window.
-    let mut camera = match daemon.camera.lock() {
+    // Keep watching the user for the rest of the window. This phase runs
+    // only after a real face match for the caller's own authorized request,
+    // so it is exempt from the per-user camera budget.
+    let mut camera = match daemon.camera_acquire(None) {
         Ok(c) => c,
         Err(_) => {
             remove_approval(daemon, id);
             return ApprovalVerdict::CameraError;
         }
     };
-    if let Err(e) = camera.acquire() {
-        log::warn!("approval: cannot keep watching the camera: {e}");
-        remove_approval(daemon, id);
-        return ApprovalVerdict::CameraError;
-    }
     let templates = match load_templates(daemon, user) {
         Ok(t) => t,
         Err(_) => {
@@ -1189,6 +1196,27 @@ fn run_approval_phase(
     verdict
 }
 
+/// Write the per-approval secret to a root-only file (0600), truncating any
+/// previous copy for the same approval (the dialog re-spawns with the same
+/// secret when the user steps back into the frame). Keeps the secret out of
+/// the dialog's argv, which is world-readable on default Linux
+/// (`/proc/<pid>/cmdline`, mode 0444, without hidepid) and is recorded by
+/// systemd in the transient unit's ExecStart line.
+fn write_secret_file(path: &std::path::Path, secret: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true).mode(0o600);
+    match opts.open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(secret.as_bytes()) {
+                log::warn!("cannot write approval secret file {}: {e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("cannot create approval secret file {}: {e}", path.display()),
+    }
+}
+
 /// Launch the secure-console approval dialog (`hiro-approve`) on a
 /// dedicated VT. Runs outside the hardened daemon unit via `systemd-run`
 /// (needed for VT/console ioctls and `/dev/tty` access), falling back to a
@@ -1196,10 +1224,10 @@ fn run_approval_phase(
 /// terminal). Best-effort: if the dialog cannot be shown, the approval
 /// simply waits out its window as if no one were watching.
 ///
-/// The per-approval `secret` is passed to the dialog so its decision can be
-/// authenticated (`Op::Approve` requires root + this secret for secure
-/// approvals). Non-root processes cannot read a root process's argv, so a
-/// compromised session never learns it.
+/// The per-approval `secret` is handed to the dialog through a root-only
+/// file (see [`write_secret_file`]) so its decision can be authenticated
+/// (`Op::Approve` requires root + this secret for secure approvals), while
+/// never appearing on the dialog's command line.
 fn spawn_secure_dialog(
     daemon: &SharedDaemon,
     id: u64,
@@ -1219,6 +1247,11 @@ fn spawn_secure_dialog(
             cfg.daemon.socket_path.clone(),
         )
     };
+    // The dialog can be re-spawned when the user steps back into the
+    // frame; a monotonically increasing sequence keeps the transient
+    // unit name unique so a re-spawn never collides with a dialog that
+    // is still shutting down.
+    let seq = DIALOG_SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut args = vec![
         format!("--vt={vt}"),
         format!("--socket={}", socket.display()),
@@ -1227,17 +1260,21 @@ fn spawn_secure_dialog(
         format!("--service={service}"),
         format!("--timeout-ms={timeout_ms}"),
     ];
-    if let Some(s) = secret {
-        args.push(format!("--secret={s}"));
-    }
+    let secret_path = if let Some(s) = secret {
+        let dir = socket
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("/run"));
+        let file = dir.join(format!("approve-{id}.secret"));
+        write_secret_file(&file, s);
+        args.push(format!("--secret-file={}", file.display()));
+        Some(file)
+    } else {
+        None
+    };
     let dialog_str = dialog.display().to_string();
 
     std::thread::spawn(move || {
-        // The dialog can be re-spawned when the user steps back into the
-        // frame; a monotonically increasing sequence keeps the transient
-        // unit name unique so a re-spawn never collides with a dialog that
-        // is still shutting down.
-        let seq = DIALOG_SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unit = format!("hiro-approve-{id}-{seq}");
         let mut cmd = std::process::Command::new("systemd-run");
         cmd.args(["--quiet", "--collect", "--no-ask-password"])
@@ -1245,6 +1282,8 @@ fn spawn_secure_dialog(
             .arg(&dialog_str)
             .args(&args);
         match cmd.status() {
+            // systemd-run returns as soon as the unit is started; the
+            // dialog itself reads and unlinks the secret file.
             Ok(st) if st.success() => return,
             Ok(st) => log::warn!("systemd-run exited {st}; spawning secure dialog directly"),
             Err(e) => log::warn!("systemd-run unavailable ({e}); spawning secure dialog directly"),
@@ -1252,8 +1291,18 @@ fn spawn_secure_dialog(
         match std::process::Command::new(&dialog_str).args(&args).spawn() {
             Ok(mut child) => {
                 let _ = child.wait();
+                // The dialog unlinks the secret file after reading it; if
+                // it never did (crash), clean up the stale copy.
+                if let Some(p) = &secret_path {
+                    let _ = std::fs::remove_file(p);
+                }
             }
-            Err(e) => log::warn!("cannot launch secure dialog {dialog_str}: {e}"),
+            Err(e) => {
+                log::warn!("cannot launch secure dialog {dialog_str}: {e}");
+                if let Some(p) = &secret_path {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
         }
     });
 }
@@ -1316,20 +1365,27 @@ fn attach_keyring_password(
         }
     };
 
-    let plain = match daemon.km.unseal(&secret) {
+    let plain = match daemon.km.unseal(user.as_bytes(), &secret) {
         Ok(p) => p,
         Err(e) => {
             log::error!("hiro: cannot unseal keyring password for {user}: {e}");
             return;
         }
     };
-    let Ok(password) = String::from_utf8(plain) else {
-        log::error!("hiro: sealed keyring password for {user} is not valid UTF-8");
-        return;
+    // Zeroize the plaintext on the invalid-UTF-8 path: `into_bytes` hands
+    // the buffer back so it can be wiped before the Vec is freed.
+    let password = match String::from_utf8(plain) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut bytes = e.into_bytes();
+            bytes.fill(0);
+            log::error!("hiro: sealed keyring password for {user} is not valid UTF-8");
+            return;
+        }
     };
     // Zeroize the password buffer when it goes out of scope at the end of
-    // this function (the copy put into the response is freed after the
-    // connection writes it).
+    // this function (the copy put into the response is zeroized after the
+    // connection writes it; see server.rs).
     let password = Zeroizing::new(password);
 
     if !daemon.password_checker.check(user, &password) {
@@ -1637,10 +1693,8 @@ fn enroll_inner(
     }
 
     let mut camera = daemon
-        .camera
-        .lock()
-        .map_err(|_| "camera lock poisoned".to_string())?;
-    camera.acquire().map_err(|e| e.to_string())?;
+        .camera_acquire(Some(user))
+        .map_err(|e| e.to_string())?;
 
     // Record the camera-pinning binding (USB identity + driver + sysfs
     // node path) and a fresh per-user random secret. The secret marks the
@@ -1876,9 +1930,11 @@ fn enroll_inner(
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?;
     for (embedding, report) in &candidates {
+        // Bound the ciphertext to the owning user so it cannot be
+        // substituted into another account's row.
         let ciphertext = daemon
             .km
-            .seal(&embedding.serialize())
+            .seal(user.as_bytes(), &embedding.serialize())
             .map_err(|e| e.to_string())?;
         let id = store
             .add_template(
@@ -2335,6 +2391,36 @@ mod tests {
     }
 
     #[test]
+    fn camera_budget_exhaustion_rates_limits_verify() {
+        let daemon = test_daemon();
+        let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+            .unwrap()
+            .unwrap();
+        let user = me.name.clone();
+        arm_login(&daemon, &user);
+        {
+            let mut cam = daemon.camera.lock().unwrap();
+            cam.set_mock_face_every(Some(3));
+        }
+        let caller = Caller { uid: 0, pid: 1 };
+        enroll(&daemon, caller, &user, 2).unwrap();
+
+        // Exhaust the per-user camera budget (default 15s / 60s).
+        {
+            let mut policy = daemon.policy.lock().unwrap();
+            for _ in 0..10 {
+                policy.record_camera_time(&user, std::time::Duration::from_secs(2));
+            }
+        }
+        let err = verify(&daemon, caller, &user, "test-service", 5000, false).unwrap_err();
+        assert!(
+            matches!(err, AuthError::RateLimited),
+            "over-budget verify must be rate limited: {err:?}"
+        );
+    }
+
+    /// Verify without templates is a fast fail.
+    #[test]
     fn verify_without_templates_is_fast_fail() {
         let daemon = test_daemon();
         let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
@@ -2435,9 +2521,21 @@ mod tests {
         let me = nix::unistd::User::from_uid(nix::unistd::Uid::current())
             .unwrap()
             .unwrap();
-        // A non-root caller may only record their own login.
+        // A different-uid non-root caller is denied.
         let stranger = Caller { uid: 65534, pid: 1 };
         let err = record_login(&daemon, stranger, &me.name, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("denied"), "unexpected: {err}");
+        // A same-uid non-root caller is denied too: arming face auth for a
+        // boot must come from the root PAM session hook, not from any
+        // process running as the user (the after-reboot gate would be
+        // meaningless if malware in the session could arm it).
+        let same_uid = Caller {
+            uid: me.uid.as_raw(),
+            pid: 31_337,
+        };
+        let err = record_login(&daemon, same_uid, &me.name, "x")
             .unwrap_err()
             .to_string();
         assert!(err.contains("denied"), "unexpected: {err}");
@@ -2466,7 +2564,7 @@ mod tests {
             cam.set_mock_face_every(Some(3));
         }
         enroll(daemon, Caller { uid: 0, pid: 1 }, user, 4).unwrap();
-        let ciphertext = daemon.km.seal(b"login-password").unwrap();
+        let ciphertext = daemon.km.seal(user.as_bytes(), b"login-password").unwrap();
         let store = daemon.store.lock().unwrap();
         store.set_login_secret(user, Some(&ciphertext)).unwrap();
     }

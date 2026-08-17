@@ -222,13 +222,17 @@ fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
         }
     };
     let _ = set_read_timeout(&stream, CONN_IDLE_TIMEOUT_SECS);
-    let reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        let line = match read_request_line(&mut reader, MAX_REQUEST_LINE) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("dropping connection: {e}");
+                break;
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -242,11 +246,84 @@ fn handle_conn(daemon: &SharedDaemon, stream: UnixStream) {
             Ok(_) => Response::err(0, "protocol version mismatch"),
             Err(e) => Response::err(0, format!("bad request: {e}")),
         };
-        let mut out = serde_json::to_string(&response).expect("response serializes");
+        // Zeroize the serialized response: it may contain the plaintext
+        // login password (keyring unlock), and must not linger in heap
+        // memory after the connection write.
+        let mut out = zeroize::Zeroizing::new(String::with_capacity(256));
+        out.push_str(&serde_json::to_string(&response).expect("response serializes"));
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() {
             break;
         }
+    }
+}
+
+/// Maximum size of a single request line, matching the PAM client's cap.
+/// `BufReader::lines()` has no length limit, so a local client streaming
+/// data without a newline could grow daemon memory without bound.
+const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// Read one newline-terminated request line with a hard length cap.
+/// Returns `Ok(None)` on a clean EOF. The cap is enforced as bytes are
+/// buffered, so a peer that never sends a newline cannot grow the buffer.
+fn read_request_line(
+    reader: &mut BufReader<UnixStream>,
+    cap: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let (done, take) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF: emit a trailing partial line, or end cleanly.
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(finish_line(buf)))
+                };
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(p) => (true, p + 1),
+                None => (false, available.len()),
+            }
+        };
+        if buf.len() + take > cap {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request line too long",
+            ));
+        }
+        {
+            let available = reader.fill_buf()?;
+            buf.extend_from_slice(&available[..take]);
+        }
+        reader.consume(take);
+        if done {
+            return Ok(Some(finish_line(buf)));
+        }
+    }
+}
+
+fn finish_line(mut buf: Vec<u8>) -> String {
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// PAM service names are config filenames. Anything outside a conservative
+/// character set is replaced with "unknown" so a caller-supplied string can
+/// never smuggle extra text into audit detail or approval events.
+fn sanitize_service(service: &str) -> String {
+    if !service.is_empty()
+        && service.len() <= 64
+        && service
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        service.to_string()
+    } else {
+        "unknown".into()
     }
 }
 
@@ -264,10 +341,13 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
             service,
             timeout_ms,
             want_keyring,
-        } => match auth::verify(daemon, caller, &user, &service, timeout_ms, want_keyring) {
-            Ok(result) => Response::ok(id, ResultValue::Verify(result)),
-            Err(e) => Response::ok(id, ResultValue::Verify(verdict_from_error(&user, &e))),
-        },
+        } => {
+            let service = sanitize_service(&service);
+            match auth::verify(daemon, caller, &user, &service, timeout_ms, want_keyring) {
+                Ok(result) => Response::ok(id, ResultValue::Verify(result)),
+                Err(e) => Response::ok(id, ResultValue::Verify(verdict_from_error(&user, &e))),
+            }
+        }
         Op::Enroll { user, max_models } => match auth::enroll(daemon, caller, &user, max_models) {
             Ok(result) => Response::ok(id, ResultValue::Enroll(result)),
             Err(e) => Response::err(id, e),
@@ -334,10 +414,13 @@ fn dispatch(daemon: &SharedDaemon, caller: Caller, req: Request) -> Response {
                 Err(e) => Response::err(id, e),
             }
         }
-        Op::Login { user, service } => match auth::record_login(daemon, caller, &user, &service) {
-            Ok(()) => Response::ok(id, ResultValue::Login),
-            Err(e) => Response::err(id, e.to_string()),
-        },
+        Op::Login { user, service } => {
+            let service = sanitize_service(&service);
+            match auth::record_login(daemon, caller, &user, &service) {
+                Ok(()) => Response::ok(id, ResultValue::Login),
+                Err(e) => Response::err(id, e.to_string()),
+            }
+        }
         Op::Approve {
             approval_id,
             user,
@@ -570,9 +653,11 @@ fn keyring_set(
              keyring unlock not stored"
         ));
     }
+    // Bound the sealed password to its user so a ciphertext copied into
+    // another account's row can never unseal.
     let ciphertext = daemon
         .km
-        .seal(password.as_bytes())
+        .seal(user.as_bytes(), password.as_bytes())
         .map_err(|e| format!("cannot seal keyring password: {e}"))?;
     let store = daemon
         .store

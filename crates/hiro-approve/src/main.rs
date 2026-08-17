@@ -95,6 +95,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
                     .map_err(|_| format!("bad --timeout-ms value: {value}"))?
             }
             "--secret" => out.secret = Some(value.into()),
+            "--secret-file" => out.secret = Some(read_secret_file(value)?),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -107,12 +108,22 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Args, String> {
     Ok(out)
 }
 
+/// Read a per-approval secret that `hirod` wrote to a root-only file, then
+/// remove the file. The secret is never placed on the command line: a root
+/// process's argv is world-readable on default Linux (`/proc/<pid>/cmdline`
+/// is 0444 without hidepid), and `systemd-run` records the ExecStart line.
+fn read_secret_file(path: &str) -> Result<String, String> {
+    let s = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let _ = std::fs::remove_file(path);
+    Ok(s.trim().to_string())
+}
+
 fn main() {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("hiro-approve: {e}");
-            eprintln!("usage: hiro-approve --vt=N --user=U --approval-id=N [--socket=PATH] [--service=S] [--timeout-ms=N] [--secret=HEX]");
+            eprintln!("usage: hiro-approve --vt=N --user=U --approval-id=N [--socket=PATH] [--service=S] [--timeout-ms=N] [--secret-file=PATH]");
             std::process::exit(2);
         }
     };
@@ -752,6 +763,44 @@ mod tests {
             args.service
         );
         assert!(!args.service.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn secret_file_is_read_and_unlinked() {
+        // A root-only file replaces the command-line --secret: the dialog
+        // reads it and unlinks it so nothing secret lingers.
+        let path = std::env::temp_dir().join(format!(
+            "hiro-approve-test-{}-{}.secret",
+            std::process::id(),
+            randish()
+        ));
+        std::fs::write(&path, "0123456789abcdef0123456789abcdef").unwrap();
+        let args = parse_args(
+            vec![
+                "--user=alice".to_string(),
+                "--approval-id=7".to_string(),
+                format!("--secret-file={}", path.display()),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            args.secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(
+            !path.exists(),
+            "secret file must be unlinked after reading"
+        );
+    }
+
+    /// Cheap unique suffix for the temp file above (tests only).
+    fn randish() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
     }
 
     #[test]

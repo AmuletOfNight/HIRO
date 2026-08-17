@@ -113,10 +113,21 @@ impl Client {
     }
 }
 
-/// Record a login for `user` over the socket, exactly like `pam_hiro.so`'s
-/// session hook does after a successful password login. Arms face auth for
-/// the current boot (the after-reboot gate).
-fn arm_login_over_socket(client: &mut Client, socket: &std::path::Path, user: &str) {
+/// Record a login for `user`, exactly like `pam_hiro.so`'s session hook
+/// does after a successful password login. Arms face auth for the current
+/// boot (the after-reboot gate).
+///
+/// `Op::Login` is honoured only for root callers (the PAM session hook runs
+/// as root). When the test process itself runs as root the socket path is
+/// exercised end-to-end; otherwise the socket must refuse the non-root
+/// caller (proving the gate) and the login is armed directly through the
+/// auth layer with a root caller so the rest of the flow stays exercised.
+fn arm_login_over_socket(
+    client: &mut Client,
+    daemon: &Arc<Daemon>,
+    socket: &std::path::Path,
+    user: &str,
+) {
     let resp = client.call(
         socket,
         Op::Login {
@@ -124,16 +135,31 @@ fn arm_login_over_socket(client: &mut Client, socket: &std::path::Path, user: &s
             service: "ipc-login".into(),
         },
     );
-    assert!(
-        matches!(
-            resp.outcome,
-            Outcome::Ok {
-                result: ResultValue::Login
-            }
-        ),
-        "login signal failed: {:?}",
-        resp.outcome
-    );
+    if nix::unistd::geteuid().is_root() {
+        assert!(
+            matches!(
+                resp.outcome,
+                Outcome::Ok {
+                    result: ResultValue::Login
+                }
+            ),
+            "login signal failed: {:?}",
+            resp.outcome
+        );
+    } else {
+        assert!(
+            matches!(resp.outcome, Outcome::Err { .. }),
+            "non-root socket login must be refused (root-only gate): {:?}",
+            resp.outcome
+        );
+        hirod::auth::record_login(
+            daemon,
+            hirod::policy::Caller { uid: 0, pid: 1 },
+            user,
+            "ipc-login",
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -162,7 +188,7 @@ fn full_cycle_over_socket() {
 
     // Simulate the user's password login since boot (PAM session hook),
     // arming face auth for the rest of this boot.
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
 
     // No templates yet -> fast no_templates verdict.
     let resp = client.call(
@@ -291,7 +317,7 @@ fn watch_streams_state_events() {
     let user = current_user();
     let mut client = Client::new();
     // Arm face auth for this boot first (as a real password login would).
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
     let resp = client.call(
         &socket,
         Op::Verify {
@@ -374,7 +400,7 @@ fn enroll_streams_enrollment_events() {
     }
     let user = current_user();
     let mut client = Client::new();
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
     let resp = client.call(
         &socket,
         Op::Enroll {
@@ -481,7 +507,7 @@ fn keyring_flow_over_socket() {
     let mut client = Client::new();
 
     // A real login would have armed face auth for this boot already.
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
 
     // Not armed yet.
     let resp = client.call(&socket, Op::KeyringStatus { user: user.clone() });
@@ -671,7 +697,7 @@ fn login_gate_blocks_verify_until_login_over_socket() {
     );
 
     // After a login signal (as the PAM session hook sends), face auth arms.
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
     let resp = client.call(
         &socket,
         Op::Verify {
@@ -739,7 +765,7 @@ fn start_approval_env(approval_timeout_ms: u64) -> ApprovalEnv {
 
     let user = current_user();
     let mut client = Client::new();
-    arm_login_over_socket(&mut client, &socket, &user);
+    arm_login_over_socket(&mut client, &daemon, &socket, &user);
     {
         let mut cam = daemon.camera.lock().unwrap();
         cam.set_mock_face_every(Some(3));

@@ -29,6 +29,10 @@ pub struct Policy {
     cfg: SecurityConfig,
     attempts: HashMap<String, VecDeque<Instant>>,
     failures: HashMap<String, (u32, Option<Instant>)>,
+    /// Rolling camera-time usage per user: `(acquisition time, hold)`.
+    /// Enforced so a single user cannot monopolise the global camera
+    /// (blocking every other user's face auth) by chaining requests.
+    camera_usage: HashMap<String, VecDeque<(Instant, Duration)>>,
 }
 
 impl Policy {
@@ -37,6 +41,7 @@ impl Policy {
             cfg,
             attempts: HashMap::new(),
             failures: HashMap::new(),
+            camera_usage: HashMap::new(),
         }
     }
 
@@ -82,6 +87,32 @@ impl Policy {
 
     pub fn record_success(&mut self, user: &str) {
         self.failures.remove(user);
+    }
+
+    /// Whether `user` may acquire the camera right now under the rolling
+    /// camera-time budget. A window of zero disables the budget.
+    pub fn camera_budget_check(&mut self, user: &str) -> bool {
+        let window = Duration::from_secs(self.cfg.camera_budget_window_secs);
+        let max = Duration::from_secs(self.cfg.camera_budget_secs);
+        if window.is_zero() || max.is_zero() {
+            return true; // budget disabled
+        }
+        let q = self.camera_usage.entry(user.to_string()).or_default();
+        while q.front().is_some_and(|(t, _)| t.elapsed() >= window) {
+            q.pop_front();
+        }
+        let used: Duration = q.iter().map(|(_, d)| *d).sum();
+        used < max
+    }
+
+    /// Record how long `user` held the camera, against the rolling budget.
+    pub fn record_camera_time(&mut self, user: &str, held: Duration) {
+        let window = Duration::from_secs(self.cfg.camera_budget_window_secs);
+        let q = self.camera_usage.entry(user.to_string()).or_default();
+        while q.front().is_some_and(|(t, _)| t.elapsed() >= window) {
+            q.pop_front();
+        }
+        q.push_back((Instant::now(), held));
     }
 
     fn prune(&mut self, user: &str) {
@@ -164,5 +195,45 @@ mod tests {
         assert!(authorize(me, Some(1000)));
         assert!(!authorize(me, Some(1001)));
         assert!(!authorize(me, None));
+    }
+
+    #[test]
+    fn camera_budget_limits_per_user() {
+        let mut p = Policy::new(sec_cfg());
+        // 5 * 3s = 15s of camera time fills the 15s / 60s default budget.
+        for _ in 0..5 {
+            assert!(p.camera_budget_check("alice"));
+            p.record_camera_time("alice", Duration::from_secs(3));
+        }
+        assert!(
+            !p.camera_budget_check("alice"),
+            "over-budget user must be refused the camera"
+        );
+        // Other users are unaffected.
+        assert!(p.camera_budget_check("bob"));
+    }
+
+    #[test]
+    fn camera_budget_rolling_window_recovers() {
+        let mut cfg = sec_cfg();
+        cfg.camera_budget_secs = 1;
+        cfg.camera_budget_window_secs = 1;
+        let mut p = Policy::new(cfg);
+        p.record_camera_time("alice", Duration::from_millis(1100));
+        assert!(!p.camera_budget_check("alice"));
+        std::thread::sleep(Duration::from_millis(1100));
+        // The hold has aged out of the 1s rolling window.
+        assert!(p.camera_budget_check("alice"));
+    }
+
+    #[test]
+    fn camera_budget_disabled_when_zero() {
+        let mut cfg = sec_cfg();
+        cfg.camera_budget_secs = 0;
+        let mut p = Policy::new(cfg);
+        for _ in 0..100 {
+            assert!(p.camera_budget_check("alice"));
+            p.record_camera_time("alice", Duration::from_secs(60));
+        }
     }
 }

@@ -83,6 +83,12 @@ allow_camera_change = false
 # `pam_hiro.so` reports it from its session hook. Set to false to let face
 # auth work immediately after boot without a prior password login.
 require_password_after_boot = true
+# Rolling per-user camera-time budget: a single user may hold the camera for
+# at most camera_budget_secs per camera_budget_window_secs, so one account
+# cannot monopolise the camera and block every other user's face auth. 0
+# disables the budget.
+camera_budget_secs = 15
+camera_budget_window_secs = 60
 
 [storage]
 db_path = "/var/lib/hiro/templates.db"
